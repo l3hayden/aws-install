@@ -1,0 +1,8 @@
+# Backups the script leaves behind if you run it from inside a clone
+*.bak
+*.bak.*
+
+# Local notes / scratch
+*.local
+.env
+.DS_Store
