@@ -8,6 +8,7 @@
 #
 #   sudo ./provision-wordpress-tls.sh --domain example.co.nz --email you@example.com
 #   sudo ./provision-wordpress-tls.sh --domain example.co.nz --email you@example.com --dry-run
+#   sudo ./provision-wordpress-tls.sh --domain example.co.nz --htaccess     # one step only
 #
 # See README.md for what each step is for and the failure it prevents.
 
@@ -20,6 +21,13 @@ WITH_WWW=1
 BEHIND_PROXY=0
 DRY_RUN=0
 SKIP_TLS=0
+
+# Step selection. None given = run every step.
+DO_HTACCESS=0
+DO_CERTBOT=0
+DO_RENEWAL=0
+DO_WP=0
+DO_VERIFY=0
 
 usage() {
 	cat <<'USAGE'
@@ -37,6 +45,14 @@ Options:
   --skip-tls          Do the rewrite + WordPress steps only, no certbot
   --dry-run           Print what would change, touch nothing
   -h, --help          This message
+
+Steps (pick any; none given = all of them):
+  --htaccess          Check/build rewrite prerequisites: mod_rewrite,
+                      AllowOverride All, and the WordPress .htaccess
+  --certbot           Install certbot + apache plugin, obtain/expand the cert
+  --renewal           Check the renewal timer, install the apache reload hook
+  --wp-urls           Set home/siteurl, FORCE_SSL_ADMIN, proxy HTTPS detection
+  --verify            curl / and /wp-json/ on every name
 USAGE
 }
 
@@ -49,10 +65,23 @@ while [[ $# -gt 0 ]]; do
 		--behind-proxy) BEHIND_PROXY=1; shift ;;
 		--skip-tls)     SKIP_TLS=1; shift ;;
 		--dry-run)      DRY_RUN=1; shift ;;
+		--htaccess)     DO_HTACCESS=1; shift ;;
+		--certbot)      DO_CERTBOT=1; shift ;;
+		--renewal)      DO_RENEWAL=1; shift ;;
+		--wp-urls)      DO_WP=1; shift ;;
+		--verify)       DO_VERIFY=1; shift ;;
 		-h|--help)      usage; exit 0 ;;
 		*)              echo "Unknown option: $1" >&2; usage; exit 1 ;;
 	esac
 done
+
+if (( SKIP_TLS && (DO_CERTBOT || DO_RENEWAL) )); then
+	echo "--skip-tls conflicts with --certbot / --renewal" >&2; exit 1
+fi
+if (( ! (DO_HTACCESS || DO_CERTBOT || DO_RENEWAL || DO_WP || DO_VERIFY) )); then
+	DO_HTACCESS=1; DO_WP=1; DO_VERIFY=1
+	(( SKIP_TLS )) || { DO_CERTBOT=1; DO_RENEWAL=1; }
+fi
 
 # ---------------------------------------------------------------- helpers ---
 
@@ -101,12 +130,12 @@ write_file() {
 step "Preflight"
 
 [[ -n "$DOMAIN" ]] || { usage; die "--domain is required"; }
-if (( ! SKIP_TLS )); then
-	[[ -n "$EMAIL" ]] || { usage; die "--email is required unless --skip-tls"; }
+if (( DO_CERTBOT )); then
+	[[ -n "$EMAIL" ]] || { usage; die "--email is required for the certbot step"; }
 fi
 [[ $EUID -eq 0 ]] || die "run this with sudo"
 
-command -v apache2ctl >/dev/null 2>&1 || die "apache2 not found — this script targets Debian/Ubuntu Apache"
+command -v apache2ctl >/dev/null 2>&1 || (( ! (DO_HTACCESS || DO_CERTBOT || DO_RENEWAL) )) || die "apache2 not found — this script targets Debian/Ubuntu Apache"
 [[ -d "$DOCROOT" ]] || die "docroot $DOCROOT does not exist"
 [[ -f "$DOCROOT/wp-config.php" || -f "$DOCROOT/wp-load.php" ]] \
 	|| warn "no wp-config.php in $DOCROOT — continuing, but the WordPress steps will be skipped"
@@ -114,10 +143,17 @@ command -v apache2ctl >/dev/null 2>&1 || die "apache2 not found — this script 
 ok "domain      : $DOMAIN"
 (( WITH_WWW )) && ok "www variant : www.$DOMAIN" || skip "www variant : not requested"
 ok "docroot     : $DOCROOT"
+STEPS=""
+(( DO_HTACCESS )) && STEPS+="htaccess "
+(( DO_CERTBOT ))  && STEPS+="certbot "
+(( DO_RENEWAL ))  && STEPS+="renewal "
+(( DO_WP ))       && STEPS+="wp-urls "
+(( DO_VERIFY ))   && STEPS+="verify"
+ok "steps       : $STEPS"
 (( DRY_RUN ))  && warn "DRY RUN — nothing will be modified"
 
 # DNS has to resolve before certbot's HTTP-01 challenge can possibly work.
-if (( ! SKIP_TLS )); then
+if (( DO_CERTBOT )); then
 	for host in "$DOMAIN" $( (( WITH_WWW )) && echo "www.$DOMAIN" ); do
 		if getent hosts "$host" >/dev/null 2>&1; then
 			ok "DNS resolves: $host -> $(getent hosts "$host" | awk '{print $1}' | head -1)"
@@ -134,6 +170,9 @@ fi
 # so the fault stays invisible until a database import brings a real
 # permalink_structure with it.
 
+if (( ! DO_HTACCESS )); then
+	step "1. Apache rewrite prerequisites — not selected"
+else
 step "1. Apache rewrite prerequisites"
 
 if apache2ctl -M 2>/dev/null | grep -q rewrite_module; then
@@ -201,11 +240,12 @@ if [[ -n "${NEEDS_RELOAD:-}" ]]; then
 	run systemctl reload apache2
 	ok "apache reloaded"
 fi
+fi # DO_HTACCESS
 
 # ---------------------------------------------------------------- 2. TLS ----
 
-if (( SKIP_TLS )); then
-	step "2. TLS — skipped (--skip-tls)"
+if (( ! DO_CERTBOT )); then
+	step "2. certbot — not selected"
 else
 	step "2. certbot"
 
@@ -261,8 +301,8 @@ fi
 
 # ------------------------------------------------------------ 3. renewal ----
 
-if (( SKIP_TLS )); then
-	step "3. Renewal — skipped (--skip-tls)"
+if (( ! DO_RENEWAL )); then
+	step "3. Renewal — not selected"
 else
 	step "3. Renewal automation"
 
@@ -298,6 +338,9 @@ fi
 
 # -------------------------------------------------- 4. WordPress settings ---
 
+if (( ! DO_WP )); then
+	step "4. WordPress URL configuration — not selected"
+else
 step "4. WordPress URL configuration"
 
 if ! command -v wp >/dev/null 2>&1; then
@@ -378,12 +421,15 @@ PYEOF
 		skip "not behind a proxy — no X-Forwarded-Proto handling needed"
 	fi
 fi
+fi # DO_WP
 
 # ------------------------------------------------------------- 5. verify ----
 
 step "5. Verification"
 
-if (( DRY_RUN )); then
+if (( ! DO_VERIFY )); then
+	skip "not selected"
+elif (( DRY_RUN )); then
 	skip "dry run — nothing to verify"
 else
 	SCHEME=$( (( SKIP_TLS )) && echo http || echo https )

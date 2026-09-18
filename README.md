@@ -40,6 +40,24 @@ Behind Cloudflare or a load balancer that terminates TLS, add `--behind-proxy`.
 | `--skip-tls` | Rewrites and WordPress settings only. |
 | `--dry-run` | Print intended changes, touch nothing. |
 
+To run only some steps, pass one or more step flags. With none, every step
+runs.
+
+| Step flag | Runs |
+|---|---|
+| `--htaccess` | Step 1: `mod_rewrite`, `AllowOverride All`, the WordPress `.htaccess` |
+| `--certbot` | Step 2: install certbot and the apache plugin, obtain or expand the cert. Needs `--email`. |
+| `--renewal` | Step 3: check the renewal timer, install the Apache reload hook |
+| `--wp-urls` | Step 4: `home`/`siteurl`, `FORCE_SSL_ADMIN`, and with `--behind-proxy` the proxy HTTPS block |
+| `--verify` | Step 5: curl `/` and `/wp-json/` on every name |
+
+```bash
+sudo ./provision-wordpress-tls.sh --domain example.co.nz --htaccess --verify
+sudo ./provision-wordpress-tls.sh --domain example.co.nz --email you@example.com --certbot --renewal
+```
+
+`--skip-tls` can't be combined with `--certbot` or `--renewal`.
+
 Re-running is safe. Each step checks its own state and reports `✓` for done,
 `·` for already correct, `!` for needs attention. Files are backed up with a
 timestamp suffix before being replaced.
