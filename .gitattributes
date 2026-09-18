@@ -1,0 +1,9 @@
+# This script runs on Linux. A CRLF checkout puts \r on the shebang line and
+# the kernel reports "bad interpreter: /usr/bin/env bash^M". Force LF
+# regardless of the checkout platform or the user's core.autocrlf setting.
+*.sh text eol=lf
+
+# Keep docs consistent too.
+*.md text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
