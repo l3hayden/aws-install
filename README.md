@@ -17,8 +17,8 @@ actually bitten us, not a hypothetical.
 ## Usage
 
 ```bash
-scp deploy/provision-wordpress-tls.sh admin@HOST:~
 ssh admin@HOST
+curl -fsSLO https://raw.githubusercontent.com/l3hayden/aws-install/main/provision-wordpress-tls.sh
 chmod +x provision-wordpress-tls.sh
 
 # See what it would do, change nothing
