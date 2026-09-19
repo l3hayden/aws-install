@@ -28,6 +28,7 @@ DO_CERTBOT=0
 DO_RENEWAL=0
 DO_WP=0
 DO_VERIFY=0
+REPORT_ONLY=0
 
 usage() {
 	cat <<'USAGE'
@@ -53,6 +54,10 @@ Steps (pick any; none given = all of them):
   --renewal           Check the renewal timer, install the apache reload hook
   --wp-urls           Set home/siteurl, FORCE_SSL_ADMIN, proxy HTTPS detection
   --verify            curl / and /wp-json/ on every name
+  --report            Run no steps, just print the status report
+
+A status report of the whole host is always printed at the end. The exit
+status is 1 if any report line is FAIL (except under --dry-run).
 USAGE
 }
 
@@ -70,6 +75,7 @@ while [[ $# -gt 0 ]]; do
 		--renewal)      DO_RENEWAL=1; shift ;;
 		--wp-urls)      DO_WP=1; shift ;;
 		--verify)       DO_VERIFY=1; shift ;;
+		--report)       REPORT_ONLY=1; shift ;;
 		-h|--help)      usage; exit 0 ;;
 		*)              echo "Unknown option: $1" >&2; usage; exit 1 ;;
 	esac
@@ -78,7 +84,10 @@ done
 if (( SKIP_TLS && (DO_CERTBOT || DO_RENEWAL) )); then
 	echo "--skip-tls conflicts with --certbot / --renewal" >&2; exit 1
 fi
-if (( ! (DO_HTACCESS || DO_CERTBOT || DO_RENEWAL || DO_WP || DO_VERIFY) )); then
+if (( REPORT_ONLY && (DO_HTACCESS || DO_CERTBOT || DO_RENEWAL || DO_WP || DO_VERIFY) )); then
+	echo "--report runs no steps; drop it or drop the step flags" >&2; exit 1
+fi
+if (( ! REPORT_ONLY && ! (DO_HTACCESS || DO_CERTBOT || DO_RENEWAL || DO_WP || DO_VERIFY) )); then
 	DO_HTACCESS=1; DO_WP=1; DO_VERIFY=1
 	(( SKIP_TLS )) || { DO_CERTBOT=1; DO_RENEWAL=1; }
 fi
@@ -461,3 +470,184 @@ cat <<'NEXT'
     After importing a database from elsewhere, read the "After a migration"
     section of README.md before trusting a search-replace.
 NEXT
+
+# ------------------------------------------------------------- report -------
+#
+# Read-only. Checks the state of the whole host regardless of which steps ran,
+# so a partial run still shows what is left to do.
+
+REPORT_FAILS=0
+REPORT_ROWS=()
+
+# rpt STATUS LABEL DETAIL — STATUS is PASS, WARN, FAIL or N/A.
+rpt() {
+	[[ "$1" == FAIL ]] && REPORT_FAILS=$((REPORT_FAILS + 1))
+	REPORT_ROWS+=("$1|$2|$3")
+}
+
+HOSTS=("$DOMAIN")
+(( WITH_WWW )) && HOSTS+=("www.$DOMAIN")
+
+# --- rewrites
+if ! command -v apache2ctl >/dev/null 2>&1; then
+	rpt FAIL "apache2" "not installed"
+else
+	apache2ctl -M 2>/dev/null | grep -q rewrite_module \
+		&& rpt PASS "mod_rewrite" "enabled" \
+		|| rpt FAIL "mod_rewrite" "not enabled — run with --htaccess"
+
+	# Only the <Directory /var/www/> block matters for the docroot.
+	if sed -n '\#<Directory /var/www/>#,\#</Directory>#p' /etc/apache2/apache2.conf 2>/dev/null \
+		| grep -qE '^\s*AllowOverride\s+All'; then
+		rpt PASS "AllowOverride" "All for /var/www/"
+	else
+		rpt FAIL "AllowOverride" "not All for /var/www/ — .htaccess is ignored"
+	fi
+fi
+
+if [[ ! -f "$DOCROOT/.htaccess" ]]; then
+	rpt FAIL ".htaccess" "missing — run with --htaccess"
+elif ! grep -q "BEGIN WordPress" "$DOCROOT/.htaccess"; then
+	rpt FAIL ".htaccess" "present but no WordPress block"
+elif ! grep -q "HTTP_AUTHORIZATION" "$DOCROOT/.htaccess"; then
+	rpt WARN ".htaccess" "WordPress block, no HTTP_AUTHORIZATION — app passwords will 401"
+else
+	rpt PASS ".htaccess" "WordPress block + HTTP_AUTHORIZATION"
+fi
+
+# --- certbot
+if (( SKIP_TLS )); then
+	rpt N/A "certbot" "--skip-tls"
+elif ! command -v certbot >/dev/null 2>&1; then
+	rpt FAIL "certbot" "not installed — run with --certbot"
+else
+	CERTBOT_BIN=$(command -v certbot)
+	[[ "$CERTBOT_BIN" == /snap/* ]] && CERTBOT_SRC=snap || CERTBOT_SRC=apt
+	rpt PASS "certbot" "$CERTBOT_SRC, $($CERTBOT_BIN --version 2>&1 | tail -1)"
+
+	# The renewal conf records which plugin renew will use. If it says apache,
+	# renewal fails outright without the plugin — so this is the check that
+	# actually confirms whether the plugin is needed, not just whether it's there.
+	RENEW_CONF="/etc/letsencrypt/renewal/$DOMAIN.conf"
+	AUTHENTICATOR=$(sed -n 's/^\s*authenticator\s*=\s*//p' "$RENEW_CONF" 2>/dev/null | head -1 || true)
+	INSTALLER=$(sed -n 's/^\s*installer\s*=\s*//p' "$RENEW_CONF" 2>/dev/null | head -1 || true)
+	if [[ -n "$AUTHENTICATOR" ]]; then
+		NEED_WHY="renewal uses authenticator=$AUTHENTICATOR installer=${INSTALLER:-none}"
+	else
+		NEED_WHY="no renewal conf yet; this script issues with --apache"
+	fi
+	if certbot plugins 2>/dev/null | grep -q '^\* apache'; then
+		rpt PASS "apache plugin" "installed ($NEED_WHY)"
+	elif [[ -n "$AUTHENTICATOR" && "$AUTHENTICATOR" != apache && "${INSTALLER:-}" != apache ]]; then
+		rpt N/A "apache plugin" "not installed, not needed ($NEED_WHY)"
+	else
+		rpt FAIL "apache plugin" "NOT installed but required ($NEED_WHY) — apt install python3-certbot-apache"
+	fi
+
+	CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+	if [[ ! -f "$CERT" ]]; then
+		rpt FAIL "certificate" "none at $CERT — run with --certbot"
+	else
+		SANS=$(openssl x509 -in "$CERT" -noout -ext subjectAltName 2>/dev/null \
+			| tr ',' '\n' | sed -n 's/.*DNS://p' | tr -d ' ' | tr '\n' ' ' || true)
+		MISSING=""
+		for host in "${HOSTS[@]}"; do
+			grep -qw "$host" <<<"$SANS" || MISSING="$MISSING $host"
+		done
+		[[ -z "$MISSING" ]] \
+			&& rpt PASS "cert names" "$SANS" \
+			|| rpt FAIL "cert names" "has: $SANS missing:$MISSING"
+
+		END=$(openssl x509 -in "$CERT" -noout -enddate 2>/dev/null | cut -d= -f2 || true)
+		END_TS=$(date -d "$END" +%s 2>/dev/null || echo "")
+		[[ -n "$END" && -n "$END_TS" ]] && DAYS=$(( (END_TS - $(date +%s)) / 86400 ))
+		if [[ -z "$END" || -z "$END_TS" ]]; then
+			rpt FAIL "cert expiry" "could not read expiry from $CERT"
+		elif (( DAYS < 0 )); then
+			rpt FAIL "cert expiry" "EXPIRED $END"
+		elif (( DAYS < 14 )); then
+			rpt WARN "cert expiry" "$DAYS days ($END) — renewal should have run by now"
+		else
+			rpt PASS "cert expiry" "$DAYS days ($END)"
+		fi
+	fi
+fi
+
+# --- renewal scheduler
+if (( ! SKIP_TLS )); then
+	TIMER_FOUND=""
+	for t in certbot.timer snap.certbot.renew.timer; do
+		systemctl list-unit-files "$t" 2>/dev/null | grep -q "^$t" || continue
+		TIMER_FOUND=$t
+		EN=$(systemctl is-enabled "$t" 2>/dev/null || true)
+		AC=$(systemctl is-active "$t" 2>/dev/null || true)
+		NEXT_RUN=$(systemctl list-timers --all 2>/dev/null | awk -v t="$t" '$0 ~ t {print $1, $2, $3}' | head -1 || true)
+		if [[ "$EN" == enabled && "$AC" == active ]]; then
+			rpt PASS "renew scheduler" "$t enabled+active, next: ${NEXT_RUN:-unknown}"
+		else
+			rpt FAIL "renew scheduler" "$t is $EN/$AC — systemctl enable --now $t"
+		fi
+	done
+	if [[ -z "$TIMER_FOUND" ]]; then
+		if [[ -f /etc/cron.d/certbot ]] && [[ ! -d /run/systemd/system ]]; then
+			rpt PASS "renew scheduler" "/etc/cron.d/certbot (no systemd)"
+		else
+			rpt FAIL "renew scheduler" "no certbot timer or cron — cert will EXPIRE"
+		fi
+	fi
+
+	RELOAD_HOOK="/etc/letsencrypt/renewal-hooks/deploy/reload-apache.sh"
+	if [[ -x "$RELOAD_HOOK" ]]; then
+		rpt PASS "reload hook" "$RELOAD_HOOK"
+	elif [[ -f "$RELOAD_HOOK" ]]; then
+		rpt FAIL "reload hook" "$RELOAD_HOOK not executable"
+	else
+		rpt FAIL "reload hook" "missing — Apache will serve the old cert after renewal"
+	fi
+fi
+
+# --- WordPress
+if ! command -v wp >/dev/null 2>&1; then
+	rpt WARN "wp-cli" "not installed — WordPress settings not checked"
+elif [[ ! -f "$DOCROOT/wp-config.php" ]]; then
+	rpt WARN "wp-config.php" "not found in $DOCROOT"
+else
+	WP="wp --path=$DOCROOT --allow-root"
+	SCHEME=$( (( SKIP_TLS )) && echo http || echo https )
+	CANONICAL="$SCHEME://$( (( WITH_WWW )) && echo "www.$DOMAIN" || echo "$DOMAIN" )"
+	for opt in home siteurl; do
+		VAL=$($WP option get "$opt" 2>/dev/null || echo "?")
+		[[ "$VAL" == "$CANONICAL" ]] \
+			&& rpt PASS "wp $opt" "$VAL" \
+			|| rpt FAIL "wp $opt" "$VAL (want $CANONICAL)"
+	done
+	if (( ! SKIP_TLS )); then
+		$WP config has FORCE_SSL_ADMIN --type=constant 2>/dev/null \
+			&& rpt PASS "FORCE_SSL_ADMIN" "defined" \
+			|| rpt WARN "FORCE_SSL_ADMIN" "not defined"
+	fi
+	if (( BEHIND_PROXY )); then
+		grep -q 'PROXY_HTTPS_DETECT' "$DOCROOT/wp-config.php" \
+			&& rpt PASS "proxy HTTPS" "X-Forwarded-Proto block present" \
+			|| rpt FAIL "proxy HTTPS" "missing — is_ssl() will be false behind the proxy"
+	fi
+fi
+
+step "Report for $DOMAIN"
+for row in "${REPORT_ROWS[@]}"; do
+	IFS='|' read -r status label detail <<<"$row"
+	case "$status" in
+		PASS) color=$C_OK ;;
+		WARN) color=$C_WARN ;;
+		FAIL) color=$C_ERR ;;
+		*)    color=$C_SKIP ;;
+	esac
+	printf '    %s%-4s%s  %-16s %s\n' "$color" "$status" "$C_OFF" "$label" "$detail"
+done
+echo
+if (( REPORT_FAILS )); then
+	printf '    %s%d check(s) failed%s\n' "$C_ERR" "$REPORT_FAILS" "$C_OFF"
+	(( DRY_RUN )) || exit 1
+else
+	printf '    %sall checks passed%s\n' "$C_OK" "$C_OFF"
+fi

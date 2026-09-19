@@ -58,6 +58,41 @@ sudo ./provision-wordpress-tls.sh --domain example.co.nz --email you@example.com
 
 `--skip-tls` can't be combined with `--certbot` or `--renewal`.
 
+### Status report
+
+Every run ends with a read-only report on the whole host, whichever steps
+ran. `--report` prints only the report and changes nothing:
+
+```bash
+sudo ./provision-wordpress-tls.sh --domain example.co.nz --report
+```
+
+```
+==> Report for example.co.nz
+    PASS  mod_rewrite      enabled
+    PASS  AllowOverride    All for /var/www/
+    PASS  .htaccess        WordPress block + HTTP_AUTHORIZATION
+    PASS  certbot          apt, certbot 2.1.0
+    FAIL  apache plugin    NOT installed but required (renewal uses authenticator=apache installer=apache) — apt install python3-certbot-apache
+    FAIL  cert names       has: example.co.nz  missing: www.example.co.nz
+    PASS  cert expiry      59 days (Nov 18 00:19:06 2026 GMT)
+    PASS  renew scheduler  certbot.timer enabled+active, next: Sat 2026-09-19 22:13:00
+    PASS  reload hook      /etc/letsencrypt/renewal-hooks/deploy/reload-apache.sh
+    PASS  wp home          https://www.example.co.nz
+    ...
+
+    2 check(s) failed
+```
+
+The **apache plugin** line reads `/etc/letsencrypt/renewal/DOMAIN.conf` to
+see which plugin renewal will actually use. If it says `apache`, renewal fails
+outright without `python3-certbot-apache`. If the cert was issued another way
+(e.g. `webroot`), the plugin isn't needed and the line shows `N/A`.
+
+The script exits 1 if any line is `FAIL`, so it can gate automation. A
+`--dry-run` always exits 0, because its report shows the host before any
+changes.
+
 Re-running is safe. Each step checks its own state and reports `✓` for done,
 `·` for already correct, `!` for needs attention. Files are backed up with a
 timestamp suffix before being replaced.
