@@ -25,6 +25,8 @@ DOMAIN=""
 EMAIL=""
 DOCROOT="/var/www/html"
 WITH_WWW=1
+CANON_PREF=""        # www | apex; empty = www, or apex under --no-www
+CANON_GIVEN=0
 BEHIND_PROXY=0
 DRY_RUN=0
 SKIP_TLS=0
@@ -62,6 +64,12 @@ Required:
 Options:
   --docroot PATH      WordPress document root      (default: /var/www/html)
   --no-www            Request a cert for the apex only (default: apex + www)
+  --canonical www|apex
+                      Which name the site lives at; the other one 301s to it
+                      (default: www). --no-www means apex. On its own, on an
+                      installed site, it switches between the two: redirect,
+                      WordPress URLs and the URLs in content (DB backed up
+                      first), then verifies.
   --behind-proxy      Site sits behind Cloudflare / an ELB that terminates TLS.
                       Adds the X-Forwarded-Proto handling to wp-config.php.
   --skip-tls          Do the rewrite + WordPress steps only, no certbot
@@ -104,6 +112,7 @@ while [[ $# -gt 0 ]]; do
 		--email)        EMAIL="$2"; shift 2 ;;
 		--docroot)      DOCROOT="$2"; shift 2 ;;
 		--no-www)       WITH_WWW=0; shift ;;
+		--canonical)    CANON_PREF="$2"; CANON_GIVEN=1; shift 2 ;;
 		--behind-proxy) BEHIND_PROXY=1; shift ;;
 		--skip-tls)     SKIP_TLS=1; shift ;;
 		--dry-run)      DRY_RUN=1; shift ;;
@@ -136,13 +145,31 @@ if (( DO_INSTALL && ! (DO_PLUGINS || DO_HTACCESS || DO_CERTBOT || DO_RENEWAL || 
 	DO_PLUGINS=1
 	ANY_STEP=0
 fi
+# --canonical on its own switches an installed site between www and apex:
+# the redirect, the WordPress URLs (content included), and a check.
+if (( CANON_GIVEN && ! ANY_STEP && ! REPORT_ONLY )); then
+	DO_HTACCESS=1; DO_WP=1; DO_VERIFY=1
+	ANY_STEP=1
+fi
 if (( ! REPORT_ONLY && ! ANY_STEP )); then
 	DO_HTACCESS=1; DO_WP=1; DO_VERIFY=1
 	(( SKIP_TLS )) || { DO_CERTBOT=1; DO_RENEWAL=1; }
 fi
 
+case "$CANON_PREF" in
+	"")   CANON_PREF=$( (( WITH_WWW )) && echo www || echo apex ) ;;
+	www)  (( WITH_WWW )) || { echo "--canonical www needs the www name; drop --no-www" >&2; exit 1; } ;;
+	apex) ;;
+	*)    echo "--canonical must be www or apex" >&2; exit 1 ;;
+esac
+# CANON_HOST is where the site lives; OTHER_HOST (if any) redirects to it.
+if [[ "$CANON_PREF" == www ]]; then
+	CANON_HOST="www.$DOMAIN"; OTHER_HOST="$DOMAIN"
+else
+	CANON_HOST="$DOMAIN"; OTHER_HOST=$( (( WITH_WWW )) && echo "www.$DOMAIN" || true )
+fi
 SCHEME=$( (( SKIP_TLS )) && echo http || echo https )
-CANONICAL="$SCHEME://$( (( WITH_WWW )) && echo "www.$DOMAIN" || echo "$DOMAIN" )"
+CANONICAL="$SCHEME://$CANON_HOST"
 
 # ---------------------------------------------------------------- helpers ---
 
@@ -216,6 +243,36 @@ write_file() {
 	fi
 }
 
+# The other name (www or apex) 301s to the canonical one. It lives in
+# .htaccess, so it covers everything — static files and /wp-json/ too, not
+# just the pages WordPress itself redirects — and works on any site, however
+# its vhosts were made. Its own marked block, above WordPress's, which
+# WordPress never rewrites.
+CANON_BEGIN="# BEGIN canonical host (provision-wordpress-tls)"
+CANON_END="# END canonical host"
+canon_block() {
+	cat <<EOF
+$CANON_BEGIN
+# $OTHER_HOST -> $CANONICAL in one 301. Leaves certbot's challenge path alone.
+# REDIRECT_STATUS: original requests only, not WordPress's internal rewrite.
+<IfModule mod_rewrite.c>
+RewriteEngine On
+RewriteCond %{ENV:REDIRECT_STATUS} ^\$
+RewriteCond %{HTTP_HOST} ^${OTHER_HOST//./\\.}(:[0-9]+)?\$ [NC]
+RewriteCond %{REQUEST_URI} !^/\\.well-known/acme-challenge/
+RewriteRule ^ $CANONICAL%{REQUEST_URI} [R=301,L,NE]
+</IfModule>
+$CANON_END
+EOF
+}
+current_canon_block() {
+	sed -n "/^$CANON_BEGIN\$/,/^$CANON_END\$/p" "$DOCROOT/.htaccess" 2>/dev/null || true
+}
+# .htaccess minus our block, leading blank lines dropped.
+htaccess_without_canon() {
+	sed "/^$CANON_BEGIN\$/,/^$CANON_END\$/d" "$DOCROOT/.htaccess" | sed '/./,$!d'
+}
+
 # ------------------------------------------------------------- preflight ----
 
 step "Preflight"
@@ -247,6 +304,7 @@ fi
 
 ok "domain      : $DOMAIN"
 (( WITH_WWW )) && ok "www variant : www.$DOMAIN" || skip "www variant : not requested"
+ok "canonical   : $CANONICAL${OTHER_HOST:+  ($OTHER_HOST redirects here)}"
 ok "docroot     : $DOCROOT"
 STEPS=""
 (( DO_INSTALL ))  && STEPS+="install "
@@ -672,6 +730,29 @@ else
 	fi
 fi
 
+HT="$DOCROOT/.htaccess"
+if [[ -z "$OTHER_HOST" ]]; then
+	# --no-www: nothing to redirect. Clear a block left from before.
+	if [[ -n "$(current_canon_block)" ]]; then
+		if (( DRY_RUN )); then
+			printf '    %swould remove:%s canonical-host redirect from %s\n' "$C_SKIP" "$C_OFF" "$HT"
+		else
+			backup "$HT" >/dev/null
+			printf '%s\n' "$(htaccess_without_canon)" > "$HT"
+			ok "removed canonical-host redirect (no other name to redirect)"
+		fi
+	fi
+elif [[ "$(current_canon_block)" == "$(canon_block)" ]]; then
+	skip "$OTHER_HOST already redirects to $CANONICAL"
+elif (( DRY_RUN )); then
+	printf '    %swould add:%s %s -> %s (301) at the top of %s\n' "$C_SKIP" "$C_OFF" "$OTHER_HOST" "$CANONICAL" "$HT"
+else
+	backup "$HT" >/dev/null
+	# Rewrite in place (>, not mv) so the file keeps its owner and mode.
+	printf '%s\n\n%s\n' "$(canon_block)" "$(htaccess_without_canon)" > "$HT"
+	ok "$OTHER_HOST now 301s to $CANONICAL"
+fi
+
 if [[ -n "${NEEDS_RELOAD:-}" ]]; then
 	run apache2ctl configtest
 	run systemctl reload apache2
@@ -796,15 +877,55 @@ elif [[ ! -f "$DOCROOT/wp-config.php" ]]; then
 else
 	WP="wp --path=$DOCROOT --allow-root"
 
+	# get_option() returns WP_HOME/WP_SITEURL when they're defined, hiding what
+	# the database holds, and update_option() refuses a value the constant
+	# already matches. So read and write the two rows directly.
+	OPTS_TABLE="$($WP db prefix)options"
+	raw_option() {
+		$WP db query "SELECT option_value FROM $OPTS_TABLE WHERE option_name='$1'" --skip-column-names 2>/dev/null || true
+	}
 	CURRENT_HOME=$($WP option get home 2>/dev/null || echo "")
-	if [[ "$CURRENT_HOME" == "$CANONICAL" ]]; then
+	OLD_HOST=${CURRENT_HOME#*://}; OLD_HOST=${OLD_HOST%%/*}
+	if [[ "$CURRENT_HOME" == "$CANONICAL" && "$(raw_option home)" == "$CANONICAL" \
+		&& "$(raw_option siteurl)" == "$CANONICAL" ]]; then
 		skip "home/siteurl already $CANONICAL"
 	else
 		warn "home is currently '$CURRENT_HOME', canonical is '$CANONICAL'"
-		run $WP option update home "$CANONICAL"
-		run $WP option update siteurl "$CANONICAL"
+		# A www <-> apex switch on the same domain: move the URLs in content
+		# too, or every link and image costs an extra redirect. Three forms:
+		# plain, JSON-escaped, and Breakdance's JSON-in-JSON (see README,
+		# "The trap"). Matching on "//host" catches http and https alike and
+		# can't hit an email address. Anything else — a different domain —
+		# is a migration, and gets the warning below instead.
+		if [[ "$OLD_HOST" != "$CANON_HOST" && ( "$OLD_HOST" == "$DOMAIN" || "$OLD_HOST" == "www.$DOMAIN" ) ]]; then
+			if (( DRY_RUN )); then
+				printf '    %swould back up:%s the database to %s/\n' "$C_SKIP" "$C_OFF" "$BACKUP_DIR"
+				printf '    %swould replace:%s //%s with //%s in all content (plain + escaped forms)\n' \
+					"$C_SKIP" "$C_OFF" "$OLD_HOST" "$CANON_HOST"
+			else
+				mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"
+				DUMP="$BACKUP_DIR/db-before-canonical-$(date +%Y%m%d%H%M%S).sql"
+				$WP db export "$DUMP" --quiet
+				gzip "$DUMP" && chmod 600 "$DUMP.gz"
+				ok "database backed up to $DUMP.gz"
+				bs='\'
+				N=0
+				for esc in "" "$bs" "$bs$bs$bs"; do
+					c=$($WP search-replace "$esc/$esc/$OLD_HOST" "$esc/$esc/$CANON_HOST" \
+						--all-tables-with-prefix --skip-columns=guid --format=count 2>/dev/null || echo 0)
+					N=$(( N + ${c:-0} ))
+				done
+				ok "replaced $N occurrence(s) of //$OLD_HOST with //$CANON_HOST in content"
+				SWAPPED=1
+			fi
+		fi
+		run $WP db query "UPDATE $OPTS_TABLE SET option_value='$CANONICAL' WHERE option_name IN ('home','siteurl')"
 		did "set home and siteurl to $CANONICAL"
-		warn "existing content may still hold the old URL — see README, 'After a migration'"
+		# The database changed underneath WordPress; a Redis object cache
+		# would keep serving the old values and content until expiry.
+		(( DRY_RUN )) || { $WP cache flush --quiet 2>/dev/null || true; ok "object cache flushed"; }
+		[[ -n "${SWAPPED:-}" ]] \
+			|| warn "existing content may still hold the old URL — see README, 'After a migration'"
 	fi
 
 	# Pin the URL in wp-config.php too. The constants override the database,
@@ -1045,8 +1166,28 @@ if (( ! DO_VERIFY )); then
 elif (( DRY_RUN )); then
 	skip "dry run — nothing to verify"
 else
-	SCHEME=$( (( SKIP_TLS )) && echo http || echo https )
+	no_connection() {
+		warn "$1 -> no connection"
+		[[ "$SCHEME" == https ]] \
+			&& warn "  is port 443 open in the Lightsail firewall? (Networking tab — only 22 and 80 are open by default)" \
+			|| warn "  is port 80 open in the Lightsail firewall?"
+	}
 	for host in "$DOMAIN" $( (( WITH_WWW )) && echo "www.$DOMAIN" ); do
+		# The other name: one 301 straight to the canonical URL. /wp-json/ is
+		# the telling path — WordPress's own redirect never covers it.
+		if [[ "$host" == "$OTHER_HOST" ]]; then
+			url="$SCHEME://$host/wp-json/"
+			read -r code loc < <(curl -s -o /dev/null -m 20 -w '%{http_code} %{redirect_url}\n' "$url" || true) || true
+			code=${code:-000}
+			if [[ "$code" == 301 && "${loc:-}" == "$CANONICAL/wp-json/" ]]; then
+				ok "$url -> 301 $loc"
+			elif [[ "$code" == 000 ]]; then
+				no_connection "$url"
+			else
+				warn "$url -> $code ${loc:-} — expected one 301 to $CANONICAL/wp-json/ (run with --htaccess)"
+			fi
+			continue
+		fi
 		for path in "/" "/wp-json/"; do
 			url="$SCHEME://$host$path"
 			# The trailing \n matters: without it read hits EOF, returns 1, and set -e exits.
@@ -1056,17 +1197,12 @@ else
 				/wp-json/:200)
 					ok "$url -> $code $ctype" ;;
 				*:000)
-					warn "$url -> no connection"
-					[[ "$SCHEME" == https ]] \
-						&& warn "  is port 443 open in the Lightsail firewall? (Networking tab — only 22 and 80 are open by default)" \
-						|| warn "  is port 80 open in the Lightsail firewall?" ;;
+					no_connection "$url" ;;
 				/wp-json/:404)
 					warn "$url -> $code $ctype"
 					warn "  iso-8859-1 here means Apache never reached index.php — rewrites still broken" ;;
 				*:200)
 					ok "$url -> $code $ctype" ;;
-				/:301|/:302)
-					ok "$url -> $code (redirect to $CANONICAL)" ;;
 				*)
 					warn "$url -> $code $ctype" ;;
 			esac
@@ -1138,6 +1274,11 @@ elif ! grep -q "HTTP_AUTHORIZATION" "$DOCROOT/.htaccess"; then
 	rpt WARN ".htaccess" "WordPress block, no HTTP_AUTHORIZATION — app passwords will 401"
 else
 	rpt PASS ".htaccess" "WordPress block + HTTP_AUTHORIZATION"
+fi
+if [[ -n "$OTHER_HOST" ]]; then
+	[[ "$(current_canon_block)" == "$(canon_block)" ]] \
+		&& rpt PASS "canonical" "$OTHER_HOST -> $CANONICAL (301)" \
+		|| rpt FAIL "canonical" "$OTHER_HOST doesn't redirect to $CANONICAL — run with --htaccess"
 fi
 
 # --- certbot

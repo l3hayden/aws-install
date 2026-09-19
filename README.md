@@ -88,6 +88,7 @@ Behind Cloudflare or a load balancer that terminates TLS, add `--behind-proxy`.
 | `--email` | Let's Encrypt registration and expiry notices; also the WordPress admin email for `--install`. Required for the certbot step. |
 | `--docroot` | Default `/var/www/html`. |
 | `--no-www` | Cert for the apex only. Default is apex **and** `www`. |
+| `--canonical` | `www` (default) or `apex`: which name the site lives at; the other 301s to it. On its own, switches an installed site — see [Switching www ↔ apex](#switching-www--apex). |
 | `--behind-proxy` | Adds `X-Forwarded-Proto` handling to `wp-config.php`. |
 | `--skip-tls` | Rewrites and WordPress settings only. |
 | `--dry-run` | Print intended changes, touch nothing. |
@@ -251,6 +252,72 @@ That is not boilerplate. Without it PHP never sees the `Authorization` header,
 so **application passwords fail on every REST request** — which takes out MCP
 connectors, headless clients, and WP-CLI over HTTP. The symptom is a 401 that
 looks like a wrong password.
+
+#### Canonical host: www or apex
+
+A site should live at one name. Unless the other one redirects, both serve
+the site: search engines see duplicate content, and cookies, caches and
+analytics split in two. WordPress redirects *pages* to its home URL itself,
+but only after PHP has loaded WordPress, and never for static files or
+`/wp-json/`.
+
+So the same step writes a second block to `.htaccess`, above WordPress's,
+that 301s everything on the other name to the canonical URL:
+
+```apache
+# BEGIN canonical host (provision-wordpress-tls)
+<IfModule mod_rewrite.c>
+RewriteEngine On
+RewriteCond %{ENV:REDIRECT_STATUS} ^$
+RewriteCond %{HTTP_HOST} ^example\.co\.nz(:[0-9]+)?$ [NC]
+RewriteCond %{REQUEST_URI} !^/\.well-known/acme-challenge/
+RewriteRule ^ https://www.example.co.nz%{REQUEST_URI} [R=301,L,NE]
+</IfModule>
+# END canonical host
+```
+
+- `--canonical www` (default) or `--canonical apex` picks the direction.
+  `--no-www` means there's no other name, so no block (and an old one is
+  removed).
+- It matches only the other name, so the IP address and anything else are
+  untouched.
+- `REDIRECT_STATUS` limits it to the original request. Without that, the
+  pass Apache makes after WordPress's internal rewrite to `index.php` would
+  redirect *that*.
+- certbot's challenge path is exempt, so renewals on the other name keep
+  working.
+- It lives in `.htaccess` rather than the vhost, so it works on any site
+  whoever made its vhosts, and certbot's vhost edits can't disturb it.
+
+An `http://` request for the other name takes two hops (certbot's http→https
+redirect in the vhost runs before `.htaccess`); everything over https is one.
+Verify checks that `/wp-json/` on the other name gives exactly one 301 to the
+canonical URL, and the report checks the block is present.
+
+#### Switching www ↔ apex
+
+On an installed site, `--canonical` on its own does the whole switch:
+
+```bash
+sudo ./provision-wordpress-tls.sh --domain example.co.nz --canonical apex
+```
+
+1. Flips the `.htaccess` redirect.
+2. Backs up the database to `/var/backups/provision-wordpress-tls/`, then
+   rewrites `//www.example.co.nz` → `//example.co.nz` in all content with
+   `wp search-replace`, which handles PHP-serialised data. It does this in
+   three forms: plain, JSON-escaped (`\/\/`), and Breakdance's JSON-in-JSON
+   (`\\\/\\\/`, see [the trap](#the-trap-page-builders-that-double-encode)).
+   Matching on `//host` covers http and https and can't touch email
+   addresses. `guid` columns are left alone, as they should be.
+3. Sets `home`, `siteurl`, `WP_HOME` and `WP_SITEURL`, and flushes the
+   object cache so Redis doesn't keep serving old URLs.
+4. Verifies.
+
+The certificate already covers both names, so certbot isn't involved. The
+content rewrite only ever happens for a swap between the domain and its own
+`www`. A different old domain is a migration; see
+[After a migration](#after-a-migration).
 
 ### 2. certbot
 
