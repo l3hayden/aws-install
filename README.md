@@ -157,8 +157,13 @@ has no certbot package and a different Apache layout altogether.
   enough for All-in-One WP Migration imports and the Breakdance editor.
 - **A vhost for the domain.** `certbot --apache` needs a vhost whose
   `ServerName` matches, or it can't choose one non-interactively.
-- **WordPress** from wordpress.org via wp-cli, not Debian's `wordpress`
-  package, which lags behind and uses its own layout. Akismet, Hello Dolly and
+- **WordPress** from wordpress.org, not Debian's `wordpress` package, which
+  lags behind and uses its own layout. The official tarball is unpacked with
+  GNU `tar`, **not** `wp core download`: wp-cli's PHP extractor cuts long
+  paths short (WordPress 7's `php-ai-client` has plenty) and still reports
+  success, leaving a site that loads but has broken core files. Core is then
+  checked with `wp core verify-checksums`; re-running `--install` repairs a
+  damaged core without touching `wp-content` or `wp-config.php`. Akismet, Hello Dolly and
   every theme except the default are deleted. Permalinks are set to
   `/%postname%/`.
 - **Credentials.** The database password and WordPress admin password are

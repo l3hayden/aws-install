@@ -16,6 +16,11 @@
 
 set -euo pipefail
 
+# Debian 13 mounts /tmp as tmpfs, capped at half of RAM. On a small instance
+# that is too little for wp-cli to unpack WordPress, and the extract fails
+# part-way while wp-cli still reports success. /var/tmp is on disk.
+export TMPDIR=/var/tmp
+
 DOMAIN=""
 EMAIL=""
 DOCROOT="/var/www/html"
@@ -140,12 +145,28 @@ die()  { printf '    %s✗%s %s\n' "$C_ERR"  "$C_OFF" "$*" >&2; exit 1; }
 # run:" line already said it, and a ✓ would claim it happened.
 did()  { (( DRY_RUN )) || ok "$@"; }
 
+# Ask systemd about a unit directly rather than grepping list output, whose
+# format changes between releases.
+unit_loaded() { [[ "$(systemctl show -p LoadState --value "$1" 2>/dev/null || true)" == loaded ]]; }
+
+# certbot's scheduler: apt installs certbot.timer, snap installs its own.
+certbot_timer() {
+	local t
+	for t in certbot.timer snap.certbot.renew.timer; do
+		if unit_loaded "$t"; then echo "$t"; return; fi
+	done
+}
+
 run() {
 	if (( DRY_RUN )); then
 		printf '    %swould run:%s %s\n' "$C_SKIP" "$C_OFF" "$*"
 	else
 		"$@"
 	fi
+}
+# run(), but a real run's stdout is dropped (apt's unpack chatter).
+run_quiet() {
+	if (( DRY_RUN )); then run "$@"; else "$@" >/dev/null; fi
 }
 
 # Write $2 to file $1 only if the content differs. Backs up whatever was there.
@@ -404,6 +425,10 @@ max_input_vars = 5000"
 a2dismod -q mpm_prefork >/dev/null 2>&1 || true
 a2enmod -q mpm_event proxy_fcgi setenvif rewrite >/dev/null
 a2enconf -q "php$PHP_VER-fpm" >/dev/null
+# A global ServerName stops the AH00558 "could not reliably determine the
+# server's fully qualified domain name" warning on every reload.
+write_file /etc/apache2/conf-available/servername.conf "ServerName $DOMAIN"
+a2enconf -q servername >/dev/null
 ok "Apache → php$PHP_VER-fpm (mpm_event, proxy_fcgi)"
 
 # certbot --apache needs a vhost whose ServerName matches, or it can't pick
@@ -434,8 +459,43 @@ fi
 
 WP="wp --path=$DOCROOT --allow-root"
 
+# fetch_core VERSION|latest [repair] — the official tarball, unpacked with
+# GNU tar. Not `wp core download`: its PHP extractor cuts long paths short
+# (WordPress 7's php-ai-client has plenty), leaving core broken while it
+# reports success. "repair" leaves wp-content alone.
+fetch_core() {
+	local url="https://wordpress.org/latest.tar.gz" tgz="$TMPDIR/wordpress-core.tar.gz"
+	[[ "$1" != latest ]] && url="https://wordpress.org/wordpress-$1.tar.gz"
+	curl -fsSL -o "$tgz" "$url" || die "could not download $url"
+	if [[ "${2:-}" == repair ]]; then
+		tar -xzf "$tgz" --strip-components=1 -C "$DOCROOT" --exclude='wordpress/wp-content'
+	else
+		tar -xzf "$tgz" --strip-components=1 -C "$DOCROOT"
+	fi
+	rm -f "$tgz"
+}
+
+# Core files on disk that fail their checksums (a wp-cli extract that cut
+# names short, or ran out of space) get re-extracted. Never touches
+# wp-content or wp-config.php.
+repair_core() {
+	$WP core verify-checksums --quiet >/dev/null 2>&1 && return
+	warn "core files fail their checksums — re-extracting WordPress core"
+	fetch_core "$($WP core version)" repair
+	# Leftovers under cut-short names, which the real files don't replace.
+	$WP core verify-checksums 2>&1 | sed -n 's/^Warning: File should not exist: //p' \
+		| grep -E '^wp-(admin|includes)/' | while IFS= read -r f; do rm -f "$DOCROOT/$f"; done || true
+	$WP core verify-checksums --quiet >/dev/null 2>&1 \
+		|| die "core files still fail checksums — run: wp --path=$DOCROOT --allow-root core verify-checksums"
+	ok "core files repaired, checksums verified"
+}
+
 if $WP core is-installed 2>/dev/null; then
 	skip "WordPress already installed in $DOCROOT — leaving it alone"
+	# Except for missing or damaged core files (an earlier out-of-space
+	# extract, say): re-download core only, which never touches wp-content
+	# or wp-config.php.
+	repair_core
 else
 	if [[ ! -f "$DOCROOT/wp-load.php" ]]; then
 		# Debian's placeholder page is the only thing allowed to be in the way.
@@ -444,8 +504,12 @@ else
 		fi
 		[[ -z "$(find "$DOCROOT" -mindepth 1 -maxdepth 1 -print -quit)" ]] \
 			|| die "$DOCROOT is not empty and has no WordPress in it — refusing to install over it"
-		$WP core download --quiet
-		ok "downloaded WordPress $($WP core version)"
+		fetch_core latest
+		$WP core verify-checksums --quiet >/dev/null 2>&1 \
+			|| die "WordPress download fails its checksums — run: wp --path=$DOCROOT --allow-root core verify-checksums"
+		ok "downloaded WordPress $($WP core version), checksums verified"
+	else
+		repair_core
 	fi
 
 	DB_NAME=wordpress
@@ -594,7 +658,7 @@ else
 		skip "certbot already installed ($(command -v certbot))"
 	else
 		run apt-get update -qq
-		run apt-get install -y certbot
+		run_quiet apt-get install -y -qq certbot
 		did "installed certbot"
 	fi
 
@@ -606,7 +670,7 @@ else
 	elif [[ "$(command -v certbot)" == /snap/* ]]; then
 		warn "snap certbot without the apache plugin — try: snap install --classic certbot"
 	else
-		run apt-get install -y python3-certbot-apache
+		run_quiet apt-get install -y -qq python3-certbot-apache
 		did "installed python3-certbot-apache"
 	fi
 
@@ -650,8 +714,15 @@ else
 	# certbot installs its own scheduler. Do NOT add a cron on top of it: two
 	# schedulers contend for the same lock. We only verify it is there and add
 	# the reload hook, which is the piece that is genuinely missing by default.
-	if systemctl list-timers --all 2>/dev/null | grep -qi certbot; then
-		ok "systemd timer present: $(systemctl list-timers --all | grep -i certbot | awk '{print $NF}' | head -1)"
+	TIMER=$(certbot_timer)
+	if [[ -n "$TIMER" ]]; then
+		if [[ "$(systemctl is-enabled "$TIMER" 2>/dev/null || true)" == enabled \
+			&& "$(systemctl is-active "$TIMER" 2>/dev/null || true)" == active ]]; then
+			ok "systemd timer $TIMER enabled + active"
+		else
+			run systemctl enable --now "$TIMER"
+			did "enabled + started $TIMER"
+		fi
 	elif [[ -f /etc/cron.d/certbot ]]; then
 		ok "cron job present: /etc/cron.d/certbot"
 	else
@@ -841,7 +912,12 @@ else
 			case "$path:$code" in
 				/wp-json/:200)
 					ok "$url -> $code $ctype" ;;
-				/wp-json/:*)
+				*:000)
+					warn "$url -> no connection"
+					[[ "$SCHEME" == https ]] \
+						&& warn "  is port 443 open in the Lightsail firewall? (Networking tab — only 22 and 80 are open by default)" \
+						|| warn "  is port 80 open in the Lightsail firewall?" ;;
+				/wp-json/:404)
 					warn "$url -> $code $ctype"
 					warn "  iso-8859-1 here means Apache never reached index.php — rewrites still broken" ;;
 				*:200)
@@ -975,10 +1051,8 @@ fi
 
 # --- renewal scheduler
 if (( ! SKIP_TLS )); then
-	TIMER_FOUND=""
-	for t in certbot.timer snap.certbot.renew.timer; do
-		systemctl list-unit-files "$t" 2>/dev/null | grep -q "^$t" || continue
-		TIMER_FOUND=$t
+	TIMER_FOUND=$(certbot_timer)
+	for t in $TIMER_FOUND; do
 		EN=$(systemctl is-enabled "$t" 2>/dev/null || true)
 		AC=$(systemctl is-active "$t" 2>/dev/null || true)
 		NEXT_RUN=$(systemctl list-timers --all 2>/dev/null | awk -v t="$t" '$0 ~ t {print $1, $2, $3}' | head -1 || true)
@@ -1013,6 +1087,9 @@ elif [[ ! -f "$DOCROOT/wp-config.php" ]]; then
 	rpt WARN "wp-config.php" "not found in $DOCROOT"
 else
 	WP="wp --path=$DOCROOT --allow-root"
+	$WP core verify-checksums --quiet >/dev/null 2>&1 \
+		&& rpt PASS "wp core" "$($WP core version 2>/dev/null || true), checksums OK" \
+		|| rpt FAIL "wp core" "files missing or modified — re-run with --install to repair"
 	for opt in home siteurl; do
 		VAL=$($WP option get "$opt" 2>/dev/null || echo "?")
 		[[ "$VAL" == "$CANONICAL" ]] \
