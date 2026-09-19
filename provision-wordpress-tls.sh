@@ -136,6 +136,9 @@ ok()   { printf '    %s✓%s %s\n' "$C_OK"   "$C_OFF" "$*"; }
 skip() { printf '    %s·%s %s\n' "$C_SKIP" "$C_OFF" "$*"; }
 warn() { printf '    %s!%s %s\n' "$C_WARN" "$C_OFF" "$*"; }
 die()  { printf '    %s✗%s %s\n' "$C_ERR"  "$C_OFF" "$*" >&2; exit 1; }
+# After a run(): confirm only if it really ran. Under --dry-run the "would
+# run:" line already said it, and a ✓ would claim it happened.
+did()  { (( DRY_RUN )) || ok "$@"; }
 
 run() {
 	if (( DRY_RUN )); then
@@ -326,6 +329,21 @@ elif (( DRY_RUN )); then
 	skip "  create the database + user, wp-config.php, admin '$ADMIN_USER'"
 	skip "  delete Akismet, Hello Dolly and inactive themes"
 	skip "  write credentials to $CREDS_FILE"
+	# The later steps inspect what the install creates. On a bare box there's
+	# nothing to inspect yet, so previewing them just prints noise and FAILs.
+	if ! command -v apache2ctl >/dev/null 2>&1; then
+		LATER=""
+		(( DO_HTACCESS )) && LATER+="htaccess "
+		(( DO_CERTBOT ))  && LATER+="certbot "
+		(( DO_RENEWAL ))  && LATER+="renewal "
+		(( DO_WP ))       && LATER+="wp-urls "
+		(( DO_PLUGINS ))  && LATER+="plugins "
+		(( DO_VERIFY ))   && LATER+="verify"
+		skip "then: ${LATER% }"
+		skip "(bare instance — those steps inspect what the install creates, so there's nothing to preview yet)"
+		DO_HTACCESS=0; DO_CERTBOT=0; DO_RENEWAL=0; DO_WP=0; DO_PLUGINS=0; DO_VERIFY=0
+		BARE_PREVIEW=1
+	fi
 else
 step "0. Install stack + WordPress"
 
@@ -498,13 +516,13 @@ if apache2ctl -M 2>/dev/null | grep -q rewrite_module; then
 	skip "mod_rewrite already enabled"
 else
 	run a2enmod rewrite
-	ok "enabled mod_rewrite"
+	did "enabled mod_rewrite"
 	NEEDS_RELOAD=1
 fi
 
 # Debian ships AllowOverride None for /var/www/, which makes .htaccess inert.
 APACHE_CONF="/etc/apache2/apache2.conf"
-if grep -qE "^\s*AllowOverride\s+All" "$APACHE_CONF"; then
+if grep -qE "^\s*AllowOverride\s+All" "$APACHE_CONF" 2>/dev/null; then
 	skip "AllowOverride All already set in $APACHE_CONF"
 else
 	if (( DRY_RUN )); then
@@ -557,7 +575,7 @@ fi
 if [[ -n "${NEEDS_RELOAD:-}" ]]; then
 	run apache2ctl configtest
 	run systemctl reload apache2
-	ok "apache reloaded"
+	did "apache reloaded"
 fi
 fi # DO_HTACCESS
 
@@ -573,7 +591,7 @@ else
 	else
 		run apt-get update -qq
 		run apt-get install -y certbot
-		ok "installed certbot"
+		did "installed certbot"
 	fi
 
 	# The Apache plugin is a SEPARATE package on Debian/Ubuntu. Without it
@@ -585,7 +603,7 @@ else
 		warn "snap certbot without the apache plugin — try: snap install --classic certbot"
 	else
 		run apt-get install -y python3-certbot-apache
-		ok "installed python3-certbot-apache"
+		did "installed python3-certbot-apache"
 	fi
 
 	CERT_DIR="/etc/letsencrypt/live/$DOMAIN"
@@ -614,7 +632,7 @@ else
 		fi
 	else
 		run certbot "${CERT_ARGS[@]}"
-		ok "obtained certificate"
+		did "obtained certificate"
 	fi
 fi
 
@@ -678,7 +696,7 @@ else
 		warn "home is currently '$CURRENT_HOME', canonical is '$CANONICAL'"
 		run $WP option update home "$CANONICAL"
 		run $WP option update siteurl "$CANONICAL"
-		ok "set home and siteurl to $CANONICAL"
+		did "set home and siteurl to $CANONICAL"
 		warn "existing content may still hold the old URL — see README, 'After a migration'"
 	fi
 
@@ -691,7 +709,7 @@ else
 			skip "$c already $CANONICAL in wp-config.php"
 		else
 			run $WP config set "$c" "$CANONICAL" --type=constant --quiet
-			ok "set $c to $CANONICAL in wp-config.php (was: ${CUR:-unset})"
+			did "set $c to $CANONICAL in wp-config.php (was: ${CUR:-unset})"
 		fi
 	done
 
@@ -700,7 +718,7 @@ else
 			skip "FORCE_SSL_ADMIN already defined"
 		else
 			run $WP config set FORCE_SSL_ADMIN true --raw --type=constant
-			ok "set FORCE_SSL_ADMIN"
+			did "set FORCE_SSL_ADMIN"
 		fi
 	fi
 
@@ -769,10 +787,10 @@ else
 	for p in "${WP_PLUGINS[@]}"; do
 		if ! $WP plugin is-installed "$p" 2>/dev/null; then
 			run $WP plugin install "$p" --activate --quiet
-			ok "installed + activated $p"
+			did "installed + activated $p"
 		elif ! $WP plugin is-active "$p" 2>/dev/null; then
 			run $WP plugin activate "$p" --quiet
-			ok "activated $p"
+			did "activated $p"
 		else
 			skip "$p already active"
 		fi
@@ -785,12 +803,12 @@ else
 			skip "breakdance already active"
 		else
 			run $WP plugin activate breakdance --quiet
-			ok "activated breakdance"
+			did "activated breakdance"
 		fi
 	elif [[ -n "$BREAKDANCE_ZIP" ]]; then
 		[[ "$BREAKDANCE_ZIP" == http* || -f "$BREAKDANCE_ZIP" ]] || die "--breakdance: $BREAKDANCE_ZIP not found"
 		run $WP plugin install "$BREAKDANCE_ZIP" --activate --quiet
-		ok "installed + activated breakdance — enter the licence key in its setup wizard"
+		did "installed + activated breakdance — enter the licence key in its setup wizard"
 	else
 		warn "breakdance not installed — download the zip from breakdance.com and re-run with"
 		warn "    --plugins --breakdance /path/to/breakdance.zip"
@@ -847,6 +865,12 @@ NEXT
 #
 # Read-only. Checks the state of the whole host regardless of which steps ran,
 # so a partial run still shows what is left to do.
+
+if (( ${BARE_PREVIEW:-0} )); then
+	step "Report — skipped"
+	skip "bare instance: nothing installed yet, so every check would FAIL. Run without --dry-run."
+	exit 0
+fi
 
 REPORT_FAILS=0
 REPORT_ROWS=()
