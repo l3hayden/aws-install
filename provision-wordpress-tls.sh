@@ -210,15 +210,88 @@ STEPS=""
 ok "steps       : $STEPS"
 (( DRY_RUN ))  && warn "DRY RUN — nothing will be modified"
 
-# DNS has to resolve before certbot's HTTP-01 challenge can possibly work.
+# DNS has to point here before certbot's HTTP-01 challenge can possibly work.
+#
+# Checked against public resolvers over HTTPS, not this machine's resolver.
+# Let's Encrypt asks public DNS, and a local or router cache can hold on to a
+# "doesn't exist" answer from before the record was created — so a local
+# lookup can fail when certbot would succeed, or the other way round.
+
+# Public IPv4 of this instance: IMDSv2 first (Lightsail enforces v2), then an
+# external echo service. Prints nothing if neither answers.
+public_ip() {
+	local tok="" ip=""
+	tok=$(curl -s -m 2 -X PUT http://169.254.169.254/latest/api/token \
+		-H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null || true)
+	if [[ -n "$tok" ]]; then
+		ip=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $tok" \
+			http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || true)
+	fi
+	[[ "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || ip=$(curl -s -m 5 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true)
+	if [[ "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then echo "$ip"; fi
+}
+
+# doh NAME TYPE — JSON answer from Cloudflare, falling back to Google.
+doh() {
+	curl -s -m 5 -H 'accept: application/dns-json' "https://cloudflare-dns.com/dns-query?name=$1&type=$2" 2>/dev/null \
+		|| curl -s -m 5 "https://dns.google/resolve?name=$1&type=$2" 2>/dev/null || true
+}
+# doh_answers JSON TYPENUM — one record value per line (1 = A, 28 = AAAA).
+doh_answers() {
+	grep -o "\"type\":$2,\"TTL\":[0-9]*,\"data\":\"[^\"]*\"" <<<"$1" | sed 's/.*"data":"//; s/"$//' || true
+}
+
 if (( DO_CERTBOT )); then
+	PUBLIC_IP=$(public_ip)
+	[[ -n "$PUBLIC_IP" ]] && ok "public IP   : $PUBLIC_IP" || warn "could not determine this instance's public IP"
+
+	DNS_BAD=0
 	for host in "$DOMAIN" $( (( WITH_WWW )) && echo "www.$DOMAIN" ); do
-		if getent hosts "$host" >/dev/null 2>&1; then
-			ok "DNS resolves: $host -> $(getent hosts "$host" | awk '{print $1}' | head -1)"
-		else
-			die "DNS does not resolve for $host — certbot will fail. Fix DNS first."
+		J=$(doh "$host" A)
+		if [[ -z "$J" ]]; then
+			warn "could not reach public DNS to check $host — carrying on, certbot will say if it's wrong"
+			continue
 		fi
+		IPS=$(doh_answers "$J" 1 | tr '\n' ' ')
+		if [[ -z "$IPS" ]]; then
+			# The SOA TTL in the authority section is how long resolvers may
+			# cache "doesn't exist" for this zone.
+			NEG=$(grep -o '"Authority":\[{[^]]*' <<<"$J" | grep -o '"TTL":[0-9]*' | head -1 | cut -d: -f2 || true)
+			NEG_NOTE=""
+			[[ -n "$NEG" ]] && NEG_NOTE=" (resolvers may cache that for up to $(( NEG / 60 )) min)"
+			warn "$host: no A record in public DNS$NEG_NOTE"
+			DNS_BAD=1
+		elif [[ -n "$PUBLIC_IP" ]] && ! grep -qw -- "$PUBLIC_IP" <<<"$IPS"; then
+			if (( BEHIND_PROXY )); then
+				ok "DNS: $host -> ${IPS% } (proxy; this instance is $PUBLIC_IP)"
+			else
+				warn "$host -> ${IPS% } in public DNS, but this instance is $PUBLIC_IP"
+				DNS_BAD=1
+			fi
+		else
+			ok "DNS: $host -> ${IPS% } (public DNS)"
+		fi
+		AAAA=$(doh_answers "$(doh "$host" AAAA)" 28 | tr '\n' ' ')
+		[[ -n "$AAAA" ]] && warn "$host also has AAAA ${AAAA% } — Let's Encrypt prefers IPv6, so that must reach this instance too"
 	done
+
+	if (( DNS_BAD )); then
+		echo
+		warn "Create these DNS records, then re-run:"
+		for host in "$DOMAIN" $( (( WITH_WWW )) && echo "www.$DOMAIN" ); do
+			warn "    A    $host    ${PUBLIC_IP:-<static IP of this instance>}"
+		done
+		warn "This check asks public DNS (Cloudflare/Google), the same as Let's Encrypt, so a"
+		warn "stale cache on this machine, your PC or your router doesn't affect it. To check"
+		warn "from your PC the same way:  nslookup $DOMAIN 1.1.1.1"
+		warn "Use a Lightsail static IP — the default public IP changes on stop/start."
+		(( ! WITH_WWW )) || warn "No www record wanted? Add --no-www."
+		if (( DRY_RUN )); then
+			warn "dry run — carrying on anyway"
+		else
+			die "DNS isn't pointing here yet — certbot would fail. (--skip-tls installs over http meanwhile.)"
+		fi
+	fi
 fi
 
 # ------------------------------------------------------------ 0. install ----

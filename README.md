@@ -37,6 +37,15 @@ That installs the stack and WordPress, then runs every other step: `.htaccess`,
 certificate, renewal, URLs, plugins, verification and the report. The
 WordPress and database passwords are in `~/wordpress_credentials`.
 
+Before requesting a certificate, the script checks DNS against **public**
+resolvers (Cloudflare, falling back to Google). That's what Let's Encrypt
+uses, and it avoids stale caches: if a name was looked up before its record
+existed, your PC, router or the instance can keep answering "doesn't exist"
+for as long as the zone's negative TTL (30 minutes on some zones). If a
+record is missing or points elsewhere, it prints the exact `A` records to
+create with this instance's public IP. To check from your PC the same way,
+ask a public resolver directly: `nslookup test.example.co.nz 1.1.1.1`.
+
 If DNS isn't pointing at the instance yet, add `--skip-tls` to get a working
 http site now, then run the script again later without `--install` or `--skip-tls`
 to add the certificate and switch to https.
