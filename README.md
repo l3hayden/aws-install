@@ -3,7 +3,8 @@
 Everything a Debian + Apache + WordPress instance needs before it can serve a
 real site: the stack itself on a bare instance, rewrite rules, a TLS
 certificate that covers every name people actually type, renewal that survives
-unattended, the WordPress-side URL settings, and the plugins every site gets.
+unattended, the WordPress-side URL settings, the plugins every site gets, and
+optionally a Redis object cache.
 
 `provision-wordpress-tls.sh` does all of it. This file explains what each step
 is for and which failure it prevents — every one of them is something that has
@@ -153,8 +154,14 @@ The script exits 1 if any line is `FAIL`, so it can gate automation. A
 changes.
 
 Re-running is safe. Each step checks its own state and reports `✓` for done,
-`·` for already correct, `!` for needs attention. Files are backed up with a
-timestamp suffix before being replaced.
+`·` for already correct, `!` for needs attention.
+
+Before changing a file, the script copies it to
+`/var/backups/provision-wordpress-tls/` (root-only), named after its path plus
+a timestamp. Backups are deliberately kept **out of the docroot**: Apache
+doesn't run `wp-config.php.bak` as PHP, it serves it as plain text, database
+password included. The report fails if it finds any `*.bak` files in the
+docroot.
 
 Requires `python3` for the `--behind-proxy` wp-config edit (part of every Debian 13
 cloud image). Without it the script prints the snippet for you to paste.

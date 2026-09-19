@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Provision a Debian + Apache + WordPress host: optionally install the whole
+# Provision a Debian 13+ Apache + WordPress host: optionally install the whole
 # stack on a bare instance, then rewrites, TLS, renewal, the WordPress-side
-# URL settings and the standard plugins.
+# URL settings, the standard plugins and optionally a Redis object cache.
 #
 # Idempotent — safe to re-run. Every step checks its own state first and says
 # what it did or why it skipped.
@@ -55,7 +55,9 @@ Debian 13 or later only.
 
 Required:
   --domain DOMAIN     Apex domain, e.g. example.co.nz (no scheme, no www)
-  --email EMAIL       Let's Encrypt registration + expiry notices
+  --email EMAIL       Let's Encrypt registration + expiry notices, and the
+                      WordPress admin email for --install. Needed whenever
+                      the certbot step or --install runs.
 
 Options:
   --docroot PATH      WordPress document root      (default: /var/www/html)
@@ -78,7 +80,8 @@ Steps (pick any; none given = htaccess certbot renewal wp-urls verify):
   --htaccess          Check/build rewrite prerequisites: mod_rewrite,
                       AllowOverride All, and the WordPress .htaccess
   --certbot           Install certbot + apache plugin, obtain/expand the cert
-  --renewal           Check the renewal timer, install the apache reload hook
+  --renewal           Check the renewal timer (starting it if stopped), install
+                      the apache reload hook
   --wp-urls           WP_HOME/WP_SITEURL in wp-config.php, home/siteurl,
                       FORCE_SSL_ADMIN, proxy HTTPS detection
   --plugins           Install + activate the standard plugins
@@ -90,6 +93,8 @@ Steps (pick any; none given = htaccess certbot renewal wp-urls verify):
 
 A status report of the whole host is always printed at the end. The exit
 status is 1 if any report line is FAIL (except under --dry-run).
+
+Files are backed up to /var/backups/provision-wordpress-tls/ before changes.
 USAGE
 }
 
@@ -176,6 +181,19 @@ run_quiet() {
 	if (( DRY_RUN )); then run "$@"; else "$@" >/dev/null; fi
 }
 
+# Copies of files taken before they're changed. Kept out of the docroot: a
+# wp-config.php.bak there is served as plain text, database password included.
+BACKUP_DIR=/var/backups/provision-wordpress-tls
+
+# backup FILE — copy it into BACKUP_DIR, print where it went.
+backup() {
+	local dest
+	dest="$BACKUP_DIR/$(tr / _ <<<"${1#/}").$(date +%Y%m%d%H%M%S)"
+	mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"
+	cp -a "$1" "$dest"
+	echo "$dest"
+}
+
 # Write $2 to file $1 only if the content differs. Backs up whatever was there.
 write_file() {
 	local path="$1" content="$2"
@@ -184,12 +202,10 @@ write_file() {
 		return
 	fi
 	if [[ -f "$path" ]]; then
-		local backup="${path}.bak.$(date +%Y%m%d%H%M%S)"
 		if (( DRY_RUN )); then
-			printf '    %swould back up:%s %s -> %s\n' "$C_SKIP" "$C_OFF" "$path" "$backup"
+			printf '    %swould back up:%s %s -> %s/\n' "$C_SKIP" "$C_OFF" "$path" "$BACKUP_DIR"
 		else
-			cp -a "$path" "$backup"
-			warn "existing file backed up to $backup"
+			warn "existing file backed up to $(backup "$path")"
 		fi
 	fi
 	if (( DRY_RUN )); then
@@ -600,17 +616,22 @@ else
 fi
 
 # Debian ships AllowOverride None for /var/www/, which makes .htaccess inert.
+# Only that block matters: other blocks saying All prove nothing about it.
 APACHE_CONF="/etc/apache2/apache2.conf"
-if grep -qE "^\s*AllowOverride\s+All" "$APACHE_CONF" 2>/dev/null; then
-	skip "AllowOverride All already set in $APACHE_CONF"
+var_www_override_all() {
+	sed -n '\#<Directory /var/www/>#,\#</Directory>#p' "$APACHE_CONF" 2>/dev/null \
+		| grep -qE '^\s*AllowOverride\s+All'
+}
+if var_www_override_all; then
+	skip "AllowOverride All already set for <Directory /var/www/>"
 else
 	if (( DRY_RUN )); then
 		printf '    %swould set:%s AllowOverride All for <Directory /var/www/> in %s\n' "$C_SKIP" "$C_OFF" "$APACHE_CONF"
 	else
-		cp -a "$APACHE_CONF" "${APACHE_CONF}.bak.$(date +%Y%m%d%H%M%S)"
+		backup "$APACHE_CONF" >/dev/null
 		# Only inside the <Directory /var/www/> block — leave / and others alone.
 		sed -i '\#<Directory /var/www/>#,\#</Directory># s/AllowOverride None/AllowOverride All/' "$APACHE_CONF"
-		if grep -qE "^\s*AllowOverride\s+All" "$APACHE_CONF"; then
+		if var_www_override_all; then
 			ok "set AllowOverride All for <Directory /var/www/>"
 			NEEDS_RELOAD=1
 		else
@@ -825,7 +846,7 @@ else
 		elif (( DRY_RUN )); then
 			printf '    %swould insert:%s X-Forwarded-Proto block into wp-config.php\n' "$C_SKIP" "$C_OFF"
 		else
-			cp -a "$DOCROOT/wp-config.php" "$DOCROOT/wp-config.php.bak.$(date +%Y%m%d%H%M%S)"
+			backup "$DOCROOT/wp-config.php" >/dev/null
 			# Must run before wp-settings.php, so insert above the sentinel.
 			python3 - "$DOCROOT/wp-config.php" <<'PYEOF'
 import sys, io
@@ -957,7 +978,7 @@ appendonly no
 	if [[ "$CUR_BLOCK" == "$R_BLOCK" ]]; then
 		skip "redis.conf already capped at $R_MAX, LRU, no persistence"
 	else
-		cp -a "$REDIS_CONF" "$REDIS_CONF.bak.$(date +%Y%m%d%H%M%S)"
+		backup "$REDIS_CONF" >/dev/null
 		sed -i "/^$REDIS_MARK\$/,/^# --- end provision-wordpress-tls ---\$/d" "$REDIS_CONF"
 		printf '\n%s\n' "$R_BLOCK" >> "$REDIS_CONF"
 		ok "redis.conf: maxmemory $R_MAX, allkeys-lru, no persistence (${MEM_MB}M RAM)"
@@ -1102,6 +1123,12 @@ else
 		rpt FAIL "AllowOverride" "not All for /var/www/ — .htaccess is ignored"
 	fi
 fi
+
+# Anything like wp-config.php.bak in the docroot is downloadable as plain
+# text. Older versions of this script left backups there.
+STRAY_BAK=$(find "$DOCROOT" -maxdepth 1 -type f \( -name '*.bak' -o -name '*.bak.*' \) \
+	! -name '.ht*' -printf '%f ' 2>/dev/null || true)
+[[ -n "$STRAY_BAK" ]] && rpt FAIL "docroot backups" "${STRAY_BAK% } — downloadable; move to $BACKUP_DIR"
 
 if [[ ! -f "$DOCROOT/.htaccess" ]]; then
 	rpt FAIL ".htaccess" "missing — run with --htaccess"
