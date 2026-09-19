@@ -9,10 +9,14 @@ unattended, the WordPress-side URL settings, and the plugins every site gets.
 is for and which failure it prevents — every one of them is something that has
 actually bitten us, not a hypothetical.
 
-> **Not for Bitnami.** The old Bitnami-packaged Lightsail blueprint uses docroot
-> `/opt/bitnami/wordpress`, its own Apache, and `bncert-tool` instead of
-> certbot. This script targets a plain Debian instance with docroot
-> `/var/www/html`. Check with `ls /opt/bitnami` before you start.
+> **Debian 13 or later only.** The script checks and stops on anything else.
+> Debian 13 is the first release whose own repositories carry a current PHP
+> (8.4), Redis and certbot's Apache plugin, so nothing needs third-party repos
+> or per-release workarounds. Older servers get rebuilt on Debian 13, not
+> patched in place.
+>
+> Not for the Lightsail WordPress blueprints either (Bitnami's or Lightsail's
+> own): start from the plain Debian 13 OS blueprint.
 
 ## Usage
 
@@ -127,7 +131,7 @@ sudo ./provision-wordpress-tls.sh --domain example.co.nz --report
     PASS  mod_rewrite      enabled
     PASS  AllowOverride    All for /var/www/
     PASS  .htaccess        WordPress block + HTTP_AUTHORIZATION
-    PASS  certbot          apt, certbot 2.1.0
+    PASS  certbot          apt, certbot 4.0.0
     FAIL  apache plugin    NOT installed but required (renewal uses authenticator=apache installer=apache) — apt install python3-certbot-apache
     FAIL  cert names       has: example.co.nz  missing: www.example.co.nz
     PASS  cert expiry      59 days (Nov 18 00:19:06 2026 GMT)
@@ -152,17 +156,16 @@ Re-running is safe. Each step checks its own state and reports `✓` for done,
 `·` for already correct, `!` for needs attention. Files are backed up with a
 timestamp suffix before being replaced.
 
-Requires `python3` for the `--behind-proxy` wp-config edit (present on any host
-with apt certbot). Without it the script prints the snippet for you to paste.
+Requires `python3` for the `--behind-proxy` wp-config edit (part of every Debian 13
+cloud image). Without it the script prints the snippet for you to paste.
 
 ## What it does, and why
 
 ### 0. Install (`--install`)
 
-Only on **Debian 13**. It's the first Debian release whose own repositories
-carry a current PHP (8.4), and certbot's Apache plugin is a normal package.
-Debian 12 is stuck on PHP 8.2 without a third-party repo; Amazon Linux 2023
-has no certbot package and a different Apache layout altogether.
+Turns a bare Debian 13 instance into a running WordPress. (Amazon Linux 2023
+was the other option; it has no certbot package and a different Apache
+layout altogether.)
 
 - **Swap.** A 1 GB swap file if the instance has under 2 GB RAM. MariaDB and
   PHP on a 512 MB or 1 GB plan get killed by the kernel without it.
@@ -390,11 +393,10 @@ Not part of the default run. Add it when a site should have an object cache.
   the `object-cache.php` drop-in that actually turns caching on. An existing
   drop-in from a different cache plugin is left alone.
 
-On an existing site it installs only what's missing, but it does apply the
-`redis.conf` block and restart Redis and PHP, which empties the cache. The
-report shows the object cache connection and Redis's memory cap whenever the
-plugin or server is present, so on an older server run `--report` first to
-see what's there.
+Run on a site that already has Redis, it installs only what's missing, but
+it does apply the `redis.conf` block and restart Redis and PHP, which empties
+the cache. The report shows the object cache connection and Redis's memory
+cap whenever the plugin or server is present.
 
 ## After a migration
 

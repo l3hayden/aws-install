@@ -51,6 +51,8 @@ usage() {
 	cat <<'USAGE'
 Usage: provision-wordpress-tls.sh --domain DOMAIN --email EMAIL [options]
 
+Debian 13 or later only.
+
 Required:
   --domain DOMAIN     Apex domain, e.g. example.co.nz (no scheme, no www)
   --email EMAIL       Let's Encrypt registration + expiry notices
@@ -69,7 +71,7 @@ Options:
   -h, --help          This message
 
 Steps (pick any; none given = htaccess certbot renewal wp-urls verify):
-  --install           Bare Debian 13 instance: Apache, PHP-FPM, MariaDB,
+  --install           Bare Debian 13+ instance: Apache, PHP-FPM, MariaDB,
                       wp-cli, latest WordPress with no bundled plugins,
                       credentials to ~/wordpress_credentials. On its own it
                       also runs every other step, plugins included.
@@ -208,18 +210,20 @@ if (( DO_CERTBOT )); then
 fi
 [[ $EUID -eq 0 ]] || die "run this with sudo"
 
+# Debian 13+ only, for every step. It's the first release whose own repos
+# carry a current PHP (8.4) and Redis, so nothing here needs third-party repos
+# or per-release branches. Older hosts get rebuilt, not patched.
+OS_ID=$(. /etc/os-release && echo "${ID:-}")
+OS_VER=$(. /etc/os-release && echo "${VERSION_ID:-}")
+[[ "$OS_ID" == debian && "$OS_VER" =~ ^[0-9]+$ ]] && (( OS_VER >= 13 )) \
+	|| die "needs Debian 13 or later; this is $(. /etc/os-release && echo "${PRETTY_NAME:-unknown}")"
+ok "os          : Debian $OS_VER"
+
 if (( DO_INSTALL )); then
 	ADMIN_EMAIL="${ADMIN_EMAIL:-$EMAIL}"
 	[[ -n "$ADMIN_EMAIL" ]] || { usage; die "--install needs --email or --admin-email for the WordPress admin"; }
-	# Debian 13 is the release whose own repos carry a current PHP (8.4) and
-	# certbot's apache plugin. Older releases need third-party PHP repos.
-	OS_ID=$(. /etc/os-release && echo "${ID:-}")
-	OS_VER=$(. /etc/os-release && echo "${VERSION_ID:-}")
-	[[ "$OS_ID" == debian && "$OS_VER" == 13 ]] \
-		|| die "--install targets Debian 13; this is $(. /etc/os-release && echo "${PRETTY_NAME:-unknown}")"
-	ok "os          : Debian $OS_VER"
 else
-	command -v apache2ctl >/dev/null 2>&1 || (( ! (DO_HTACCESS || DO_CERTBOT || DO_RENEWAL) )) || die "apache2 not found — this script targets Debian/Ubuntu Apache (use --install on a bare instance)"
+	command -v apache2ctl >/dev/null 2>&1 || (( ! (DO_HTACCESS || DO_CERTBOT || DO_RENEWAL) )) || die "apache2 not found — use --install on a bare instance"
 	[[ -d "$DOCROOT" ]] || die "docroot $DOCROOT does not exist"
 	[[ -f "$DOCROOT/wp-config.php" || -f "$DOCROOT/wp-load.php" ]] \
 		|| warn "no wp-config.php in $DOCROOT — continuing, but the WordPress steps will be skipped"
@@ -669,7 +673,7 @@ else
 		did "installed certbot"
 	fi
 
-	# The Apache plugin is a SEPARATE package on Debian/Ubuntu. Without it
+	# The Apache plugin is a SEPARATE package on Debian. Without it
 	# certbot fails with "The apache plugin does not appear to be installed".
 	# (A snap-installed certbot bundles it — hence the branch.)
 	if certbot plugins 2>/dev/null | grep -q apache; then
