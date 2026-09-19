@@ -1,26 +1,49 @@
 # Provisioning a WordPress host on Lightsail
 
-Everything a fresh Debian/Ubuntu + Apache + WordPress instance needs before it
-can serve a real site: rewrite rules, a TLS certificate that covers every name
-people actually type, renewal that survives unattended, and the WordPress-side
-URL settings.
+Everything a Debian + Apache + WordPress instance needs before it can serve a
+real site: the stack itself on a bare instance, rewrite rules, a TLS
+certificate that covers every name people actually type, renewal that survives
+unattended, the WordPress-side URL settings, and the plugins every site gets.
 
 `provision-wordpress-tls.sh` does all of it. This file explains what each step
 is for and which failure it prevents — every one of them is something that has
 actually bitten us, not a hypothetical.
 
-> **Not for Bitnami.** The Lightsail *WordPress* blueprint is a Bitnami image:
-> docroot `/opt/bitnami/wordpress`, its own Apache, and `bncert-tool` instead of
-> certbot. This script targets a plain Debian/Ubuntu instance with docroot
+> **Not for Bitnami.** The old Bitnami-packaged Lightsail blueprint uses docroot
+> `/opt/bitnami/wordpress`, its own Apache, and `bncert-tool` instead of
+> certbot. This script targets a plain Debian instance with docroot
 > `/var/www/html`. Check with `ls /opt/bitnami` before you start.
 
 ## Usage
+
+### New site on a bare instance
+
+Create a Lightsail instance from the plain **Debian 13** OS blueprint (not the
+WordPress one), point DNS for the apex and `www` at its static IP, then:
 
 ```bash
 ssh admin@HOST
 curl -fsSLO https://raw.githubusercontent.com/l3hayden/aws-install/main/provision-wordpress-tls.sh
 chmod +x provision-wordpress-tls.sh
 
+# Upload the Breakdance zip first (it needs a breakdance.com login to download):
+#   scp breakdance.zip admin@HOST:~
+
+sudo ./provision-wordpress-tls.sh --domain example.co.nz --email you@example.com \
+  --install --breakdance ~/breakdance.zip
+```
+
+That installs the stack and WordPress, then runs every other step: `.htaccess`,
+certificate, renewal, URLs, plugins, verification and the report. The
+WordPress and database passwords are in `~/wordpress_credentials`.
+
+If DNS isn't pointing at the instance yet, add `--skip-tls` to get a working
+http site now, then run the script again later without `--install` or `--skip-tls`
+to add the certificate and switch to https.
+
+### Existing site
+
+```bash
 # See what it would do, change nothing
 sudo ./provision-wordpress-tls.sh --domain example.co.nz --email you@example.com --dry-run
 
@@ -33,27 +56,33 @@ Behind Cloudflare or a load balancer that terminates TLS, add `--behind-proxy`.
 | Flag | Effect |
 |---|---|
 | `--domain` | Apex domain, no scheme, no `www`. Required. |
-| `--email` | Let's Encrypt registration and expiry notices. Required unless `--skip-tls`. |
+| `--email` | Let's Encrypt registration and expiry notices; also the WordPress admin email for `--install`. Required for the certbot step. |
 | `--docroot` | Default `/var/www/html`. |
 | `--no-www` | Cert for the apex only. Default is apex **and** `www`. |
 | `--behind-proxy` | Adds `X-Forwarded-Proto` handling to `wp-config.php`. |
 | `--skip-tls` | Rewrites and WordPress settings only. |
 | `--dry-run` | Print intended changes, touch nothing. |
+| `--admin-user` | WordPress admin username for `--install`. Default `user`. |
+| `--admin-email` | WordPress admin email for `--install`. Default: `--email`. |
+| `--breakdance` | Breakdance zip, local path or URL, for the plugins step. |
 
-To run only some steps, pass one or more step flags. With none, every step
-runs.
+To run only some steps, pass one or more step flags. With none, steps 1–4 and
+6 run. `--install` on its own runs everything, steps 0–6.
 
 | Step flag | Runs |
 |---|---|
+| `--install` | Step 0: Apache, PHP-FPM, MariaDB, wp-cli and the latest WordPress on bare Debian 13 |
 | `--htaccess` | Step 1: `mod_rewrite`, `AllowOverride All`, the WordPress `.htaccess` |
 | `--certbot` | Step 2: install certbot and the apache plugin, obtain or expand the cert. Needs `--email`. |
 | `--renewal` | Step 3: check the renewal timer, install the Apache reload hook |
-| `--wp-urls` | Step 4: `home`/`siteurl`, `FORCE_SSL_ADMIN`, and with `--behind-proxy` the proxy HTTPS block |
-| `--verify` | Step 5: curl `/` and `/wp-json/` on every name |
+| `--wp-urls` | Step 4: `WP_HOME`/`WP_SITEURL` in `wp-config.php`, `home`/`siteurl`, `FORCE_SSL_ADMIN`, and with `--behind-proxy` the proxy HTTPS block |
+| `--plugins` | Step 5: install and activate the standard plugins |
+| `--verify` | Step 6: curl `/` and `/wp-json/` on every name |
 
 ```bash
 sudo ./provision-wordpress-tls.sh --domain example.co.nz --htaccess --verify
 sudo ./provision-wordpress-tls.sh --domain example.co.nz --email you@example.com --certbot --renewal
+sudo ./provision-wordpress-tls.sh --domain example.co.nz --plugins --breakdance ~/breakdance.zip
 ```
 
 `--skip-tls` can't be combined with `--certbot` or `--renewal`.
@@ -101,6 +130,37 @@ Requires `python3` for the `--behind-proxy` wp-config edit (present on any host
 with apt certbot). Without it the script prints the snippet for you to paste.
 
 ## What it does, and why
+
+### 0. Install (`--install`)
+
+Only on **Debian 13**. It's the first Debian release whose own repositories
+carry a current PHP (8.4), and certbot's Apache plugin is a normal package.
+Debian 12 is stuck on PHP 8.2 without a third-party repo; Amazon Linux 2023
+has no certbot package and a different Apache layout altogether.
+
+- **Swap.** A 1 GB swap file if the instance has under 2 GB RAM. MariaDB and
+  PHP on a 512 MB or 1 GB plan get killed by the kernel without it.
+- **Packages.** `apache2`, `mariadb-server`, `php-fpm` and only the PHP
+  extensions WordPress uses (mysql, curl, gd, intl, mbstring, xml, zip,
+  opcache). No phpMyAdmin.
+- **PHP-FPM, not mod_php.** Runs under Apache's event MPM, the Debian default.
+  `/etc/php/8.4/fpm/conf.d/99-wordpress.ini` raises upload and memory limits
+  enough for All-in-One WP Migration imports and the Breakdance editor.
+- **A vhost for the domain.** `certbot --apache` needs a vhost whose
+  `ServerName` matches, or it can't choose one non-interactively.
+- **WordPress** from wordpress.org via wp-cli, not Debian's `wordpress`
+  package, which lags behind and uses its own layout. Akismet, Hello Dolly and
+  every theme except the default are deleted. Permalinks are set to
+  `/%postname%/`.
+- **Credentials.** The database password and WordPress admin password are
+  generated on the instance and written to `~/wordpress_credentials` in the
+  home of the user who ran `sudo` (`/home/admin` on Lightsail), mode 600.
+  They never leave the host, so nothing secret goes near this repo. Move them
+  to your password manager and delete the file.
+
+It refuses to install over a docroot that already has something other than
+Debian's placeholder page in it. If WordPress is already installed it leaves
+it alone, so re-running is safe.
 
 ### 1. Rewrite prerequisites
 
@@ -219,7 +279,13 @@ systemctl disable --now certbot.timer
 
 ### 4. WordPress URLs
 
-Sets `home` and `siteurl` to the canonical URL and defines `FORCE_SSL_ADMIN`.
+Sets `home` and `siteurl` to the canonical URL, pins the same URL in
+`wp-config.php` as `WP_HOME` and `WP_SITEURL`, and defines `FORCE_SSL_ADMIN`.
+
+The constants override the database. A migration import that brings in an
+`http://` home can't switch the site back to http, and blueprint defaults
+like `define( 'WP_HOME', 'http://' . $_SERVER['HTTP_HOST'] )` get replaced
+with the https URL.
 
 With `--behind-proxy`, inserts this into `wp-config.php` above the
 `That's all, stop editing` line:
@@ -236,6 +302,29 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] )
 returns false, and that breaks canonical redirects (often into a loop), causes
 mixed content, and disables anything gated on a secure transport — WordPress
 application passwords and OAuth flows included.
+
+### 5. Plugins (`--plugins`)
+
+Installs and activates the plugins every site gets:
+
+| Plugin | Source |
+|---|---|
+| All-in-One WP Migration and Backup | wordpress.org, `all-in-one-wp-migration` |
+| The SEO Framework | wordpress.org, `autodescription` |
+| SMTP2GO | wordpress.org, `smtp2go` |
+| Breakdance | `--breakdance ZIP` |
+
+Breakdance isn't on wordpress.org, and the download needs a breakdance.com
+login, so the script can't fetch it. Download the zip, `scp` it to the
+instance and pass its path, or pass a URL you control (e.g. a presigned S3
+link). Then enter the licence key in Breakdance's setup wizard; updates come
+through that from then on. An existing Breakdance install is never
+overwritten.
+
+The SMTP2GO API key goes in its settings page. It's a secret, so it isn't
+handled here.
+
+To change the list, edit `WP_PLUGINS` at the top of the script.
 
 ## After a migration
 

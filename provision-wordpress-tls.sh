@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 #
-# Provision a fresh Debian/Ubuntu + Apache + WordPress host: rewrites, TLS,
-# renewal, and the WordPress-side URL settings.
+# Provision a Debian + Apache + WordPress host: optionally install the whole
+# stack on a bare instance, then rewrites, TLS, renewal, the WordPress-side
+# URL settings and the standard plugins.
 #
 # Idempotent — safe to re-run. Every step checks its own state first and says
 # what it did or why it skipped.
 #
+#   sudo ./provision-wordpress-tls.sh --domain example.co.nz --email you@example.com --install
 #   sudo ./provision-wordpress-tls.sh --domain example.co.nz --email you@example.com
 #   sudo ./provision-wordpress-tls.sh --domain example.co.nz --email you@example.com --dry-run
 #   sudo ./provision-wordpress-tls.sh --domain example.co.nz --htaccess     # one step only
@@ -21,8 +23,17 @@ WITH_WWW=1
 BEHIND_PROXY=0
 DRY_RUN=0
 SKIP_TLS=0
+ADMIN_USER="user"
+ADMIN_EMAIL=""
+BREAKDANCE_ZIP=""
 
-# Step selection. None given = run every step.
+# Plugins every site gets, by wordpress.org slug. Breakdance is not on
+# wordpress.org and needs a licensed download, so it comes from --breakdance.
+WP_PLUGINS=(all-in-one-wp-migration autodescription smtp2go)
+
+# Step selection. None given = every step except --install and --plugins.
+DO_INSTALL=0
+DO_PLUGINS=0
 DO_HTACCESS=0
 DO_CERTBOT=0
 DO_RENEWAL=0
@@ -45,14 +56,24 @@ Options:
                       Adds the X-Forwarded-Proto handling to wp-config.php.
   --skip-tls          Do the rewrite + WordPress steps only, no certbot
   --dry-run           Print what would change, touch nothing
+  --admin-user NAME   WordPress admin username for --install (default: user)
+  --admin-email EMAIL WordPress admin email for --install    (default: --email)
+  --breakdance ZIP    Breakdance plugin zip, a local path or URL. Download it
+                      from breakdance.com (needs your login).
   -h, --help          This message
 
-Steps (pick any; none given = all of them):
+Steps (pick any; none given = htaccess certbot renewal wp-urls verify):
+  --install           Bare Debian 13 instance: Apache, PHP-FPM, MariaDB,
+                      wp-cli, latest WordPress with no bundled plugins,
+                      credentials to ~/wordpress_credentials. On its own it
+                      also runs every other step, plugins included.
   --htaccess          Check/build rewrite prerequisites: mod_rewrite,
                       AllowOverride All, and the WordPress .htaccess
   --certbot           Install certbot + apache plugin, obtain/expand the cert
   --renewal           Check the renewal timer, install the apache reload hook
-  --wp-urls           Set home/siteurl, FORCE_SSL_ADMIN, proxy HTTPS detection
+  --wp-urls           WP_HOME/WP_SITEURL in wp-config.php, home/siteurl,
+                      FORCE_SSL_ADMIN, proxy HTTPS detection
+  --plugins           Install + activate the standard plugins
   --verify            curl / and /wp-json/ on every name
   --report            Run no steps, just print the status report
 
@@ -70,6 +91,11 @@ while [[ $# -gt 0 ]]; do
 		--behind-proxy) BEHIND_PROXY=1; shift ;;
 		--skip-tls)     SKIP_TLS=1; shift ;;
 		--dry-run)      DRY_RUN=1; shift ;;
+		--admin-user)   ADMIN_USER="$2"; shift 2 ;;
+		--admin-email)  ADMIN_EMAIL="$2"; shift 2 ;;
+		--breakdance)   BREAKDANCE_ZIP="$2"; shift 2 ;;
+		--install)      DO_INSTALL=1; shift ;;
+		--plugins)      DO_PLUGINS=1; shift ;;
 		--htaccess)     DO_HTACCESS=1; shift ;;
 		--certbot)      DO_CERTBOT=1; shift ;;
 		--renewal)      DO_RENEWAL=1; shift ;;
@@ -84,13 +110,22 @@ done
 if (( SKIP_TLS && (DO_CERTBOT || DO_RENEWAL) )); then
 	echo "--skip-tls conflicts with --certbot / --renewal" >&2; exit 1
 fi
-if (( REPORT_ONLY && (DO_HTACCESS || DO_CERTBOT || DO_RENEWAL || DO_WP || DO_VERIFY) )); then
+ANY_STEP=$(( DO_INSTALL || DO_PLUGINS || DO_HTACCESS || DO_CERTBOT || DO_RENEWAL || DO_WP || DO_VERIFY ))
+if (( REPORT_ONLY && ANY_STEP )); then
 	echo "--report runs no steps; drop it or drop the step flags" >&2; exit 1
 fi
-if (( ! REPORT_ONLY && ! (DO_HTACCESS || DO_CERTBOT || DO_RENEWAL || DO_WP || DO_VERIFY) )); then
+# --install on its own is a fresh box: it wants everything.
+if (( DO_INSTALL && ! (DO_PLUGINS || DO_HTACCESS || DO_CERTBOT || DO_RENEWAL || DO_WP || DO_VERIFY) )); then
+	DO_PLUGINS=1
+	ANY_STEP=0
+fi
+if (( ! REPORT_ONLY && ! ANY_STEP )); then
 	DO_HTACCESS=1; DO_WP=1; DO_VERIFY=1
 	(( SKIP_TLS )) || { DO_CERTBOT=1; DO_RENEWAL=1; }
 fi
+
+SCHEME=$( (( SKIP_TLS )) && echo http || echo https )
+CANONICAL="$SCHEME://$( (( WITH_WWW )) && echo "www.$DOMAIN" || echo "$DOMAIN" )"
 
 # ---------------------------------------------------------------- helpers ---
 
@@ -144,19 +179,33 @@ if (( DO_CERTBOT )); then
 fi
 [[ $EUID -eq 0 ]] || die "run this with sudo"
 
-command -v apache2ctl >/dev/null 2>&1 || (( ! (DO_HTACCESS || DO_CERTBOT || DO_RENEWAL) )) || die "apache2 not found — this script targets Debian/Ubuntu Apache"
-[[ -d "$DOCROOT" ]] || die "docroot $DOCROOT does not exist"
-[[ -f "$DOCROOT/wp-config.php" || -f "$DOCROOT/wp-load.php" ]] \
-	|| warn "no wp-config.php in $DOCROOT — continuing, but the WordPress steps will be skipped"
+if (( DO_INSTALL )); then
+	ADMIN_EMAIL="${ADMIN_EMAIL:-$EMAIL}"
+	[[ -n "$ADMIN_EMAIL" ]] || { usage; die "--install needs --email or --admin-email for the WordPress admin"; }
+	# Debian 13 is the release whose own repos carry a current PHP (8.4) and
+	# certbot's apache plugin. Older releases need third-party PHP repos.
+	OS_ID=$(. /etc/os-release && echo "${ID:-}")
+	OS_VER=$(. /etc/os-release && echo "${VERSION_ID:-}")
+	[[ "$OS_ID" == debian && "$OS_VER" == 13 ]] \
+		|| die "--install targets Debian 13; this is $(. /etc/os-release && echo "${PRETTY_NAME:-unknown}")"
+	ok "os          : Debian $OS_VER"
+else
+	command -v apache2ctl >/dev/null 2>&1 || (( ! (DO_HTACCESS || DO_CERTBOT || DO_RENEWAL) )) || die "apache2 not found — this script targets Debian/Ubuntu Apache (use --install on a bare instance)"
+	[[ -d "$DOCROOT" ]] || die "docroot $DOCROOT does not exist"
+	[[ -f "$DOCROOT/wp-config.php" || -f "$DOCROOT/wp-load.php" ]] \
+		|| warn "no wp-config.php in $DOCROOT — continuing, but the WordPress steps will be skipped"
+fi
 
 ok "domain      : $DOMAIN"
 (( WITH_WWW )) && ok "www variant : www.$DOMAIN" || skip "www variant : not requested"
 ok "docroot     : $DOCROOT"
 STEPS=""
+(( DO_INSTALL ))  && STEPS+="install "
 (( DO_HTACCESS )) && STEPS+="htaccess "
 (( DO_CERTBOT ))  && STEPS+="certbot "
 (( DO_RENEWAL ))  && STEPS+="renewal "
 (( DO_WP ))       && STEPS+="wp-urls "
+(( DO_PLUGINS ))  && STEPS+="plugins "
 (( DO_VERIFY ))   && STEPS+="verify"
 ok "steps       : $STEPS"
 (( DRY_RUN ))  && warn "DRY RUN — nothing will be modified"
@@ -171,6 +220,188 @@ if (( DO_CERTBOT )); then
 		fi
 	done
 fi
+
+# ------------------------------------------------------------ 0. install ----
+#
+# A bare Debian 13 instance to a running WordPress with nothing extra: no
+# phpMyAdmin, no bundled plugins. Passwords are generated on the host and only
+# ever written to wp-config.php and the credentials file — never to the repo.
+
+# Credentials land in the home of whoever ran sudo (admin on Lightsail).
+CREDS_USER="${SUDO_USER:-root}"
+CREDS_HOME=$(getent passwd "$CREDS_USER" | cut -d: -f6 || true)
+CREDS_FILE="${CREDS_HOME:-/root}/wordpress_credentials"
+
+# 24 alphanumerics: safe unquoted in SQL and shell, ~140 bits.
+gen_pass() { openssl rand -base64 48 | tr -d '/+=\n' | cut -c1-24; }
+
+if (( ! DO_INSTALL )); then
+	step "0. Install stack + WordPress — not selected"
+elif (( DRY_RUN )); then
+	step "0. Install stack + WordPress"
+	skip "dry run — would:"
+	skip "  add a 1G swap file if RAM < 2G and there is no swap"
+	skip "  apt install apache2, php-fpm + WordPress extensions, mariadb-server"
+	skip "  switch Apache to PHP-FPM, write a vhost for $DOMAIN"
+	skip "  install wp-cli, download the latest WordPress into $DOCROOT"
+	skip "  create the database + user, wp-config.php, admin '$ADMIN_USER'"
+	skip "  delete Akismet, Hello Dolly and inactive themes"
+	skip "  write credentials to $CREDS_FILE"
+else
+step "0. Install stack + WordPress"
+
+export DEBIAN_FRONTEND=noninteractive
+
+# MariaDB + PHP-FPM on a 512M/1G Lightsail plan get OOM-killed without swap.
+MEM_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+if [[ -n "$(swapon --noheadings --show=NAME 2>/dev/null)" ]]; then
+	skip "swap already configured"
+elif (( MEM_MB >= 2048 )); then
+	skip "${MEM_MB}M RAM — no swap needed"
+elif { [[ -f /swapfile ]] || { fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap -q /swapfile; }; } \
+	&& swapon /swapfile 2>/dev/null; then
+	grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+	ok "added 1G swap at /swapfile (${MEM_MB}M RAM)"
+else
+	warn "could not enable swap — ${MEM_MB}M RAM may not be enough for MariaDB + PHP"
+fi
+
+# Only what WordPress uses. php-fpm rather than mod_php: it runs under the
+# event MPM, which is the Apache default on Debian.
+PKGS=(apache2 mariadb-server php-fpm php-cli php-mysql php-curl php-gd php-intl
+	php-mbstring php-xml php-zip curl unzip ca-certificates openssl)
+MISSING_PKGS=()
+for p in "${PKGS[@]}"; do
+	dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "install ok installed" || MISSING_PKGS+=("$p")
+done
+if (( ${#MISSING_PKGS[@]} )); then
+	apt-get update -qq
+	apt-get install -y -qq --no-install-recommends "${MISSING_PKGS[@]}" >/dev/null
+	ok "installed ${MISSING_PKGS[*]}"
+else
+	skip "packages already installed"
+fi
+# opcache ships as its own package; --no-install-recommends leaves it out.
+PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+if dpkg-query -W -f='${Status}' "php$PHP_VER-opcache" 2>/dev/null | grep -q "install ok installed"; then
+	skip "php$PHP_VER-opcache already installed"
+else
+	apt-get install -y -qq --no-install-recommends "php$PHP_VER-opcache" >/dev/null
+	ok "installed php$PHP_VER-opcache"
+fi
+ok "PHP $PHP_VER"
+
+# Big enough for All-in-One WP Migration imports and Breakdance's editor.
+write_file "/etc/php/$PHP_VER/fpm/conf.d/99-wordpress.ini" "; Written by provision-wordpress-tls.sh
+upload_max_filesize = 512M
+post_max_size = 512M
+memory_limit = 256M
+max_execution_time = 300
+max_input_time = 300
+max_input_vars = 5000"
+
+a2dismod -q mpm_prefork >/dev/null 2>&1 || true
+a2enmod -q mpm_event proxy_fcgi setenvif rewrite >/dev/null
+a2enconf -q "php$PHP_VER-fpm" >/dev/null
+ok "Apache → php$PHP_VER-fpm (mpm_event, proxy_fcgi)"
+
+# certbot --apache needs a vhost whose ServerName matches, or it can't pick
+# one non-interactively.
+VHOST="/etc/apache2/sites-available/$DOMAIN.conf"
+write_file "$VHOST" "<VirtualHost *:80>
+	ServerName $DOMAIN$( (( WITH_WWW )) && printf '\n\tServerAlias www.%s' "$DOMAIN" )
+	DocumentRoot $DOCROOT
+	ErrorLog \${APACHE_LOG_DIR}/$DOMAIN-error.log
+	CustomLog \${APACHE_LOG_DIR}/$DOMAIN-access.log combined
+</VirtualHost>"
+a2ensite -q "$DOMAIN" >/dev/null
+a2dissite -q 000-default >/dev/null 2>&1 || true
+
+systemctl enable --now mariadb >/dev/null 2>&1 || true
+systemctl restart "php$PHP_VER-fpm"
+apache2ctl configtest >/dev/null 2>&1 || die "Apache config test failed — run: apache2ctl configtest"
+systemctl reload apache2 || systemctl restart apache2
+ok "services running"
+
+if command -v wp >/dev/null 2>&1; then
+	skip "wp-cli already installed"
+else
+	curl -fsSL -o /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+	chmod +x /usr/local/bin/wp
+	ok "installed $(wp --allow-root --version)"
+fi
+
+WP="wp --path=$DOCROOT --allow-root"
+
+if $WP core is-installed 2>/dev/null; then
+	skip "WordPress already installed in $DOCROOT — leaving it alone"
+else
+	if [[ ! -f "$DOCROOT/wp-load.php" ]]; then
+		# Debian's placeholder page is the only thing allowed to be in the way.
+		if [[ -f "$DOCROOT/index.html" ]] && grep -q "Apache2 Debian Default Page" "$DOCROOT/index.html"; then
+			rm -f "$DOCROOT/index.html"
+		fi
+		[[ -z "$(find "$DOCROOT" -mindepth 1 -maxdepth 1 -print -quit)" ]] \
+			|| die "$DOCROOT is not empty and has no WordPress in it — refusing to install over it"
+		$WP core download --quiet
+		ok "downloaded WordPress $($WP core version)"
+	fi
+
+	DB_NAME=wordpress
+	DB_USER=wordpress
+	DB_PASS=$(gen_pass)
+	ADMIN_PASS=$(gen_pass)
+	mariadb <<SQL
+CREATE DATABASE IF NOT EXISTS \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
+ALTER USER '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
+GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'localhost';
+FLUSH PRIVILEGES;
+SQL
+	ok "database '$DB_NAME' and user '$DB_USER'"
+
+	$WP config create --dbname="$DB_NAME" --dbuser="$DB_USER" --dbpass="$DB_PASS" \
+		--dbhost=localhost --dbcharset=utf8mb4 --force --quiet
+	$WP core install --url="$CANONICAL" --title="$DOMAIN" --admin_user="$ADMIN_USER" \
+		--admin_password="$ADMIN_PASS" --admin_email="$ADMIN_EMAIL" --skip-email >/dev/null
+	ok "installed WordPress at $CANONICAL, admin '$ADMIN_USER'"
+
+	# Ships with core; not wanted on any site.
+	for p in akismet hello; do
+		$WP plugin is-installed "$p" 2>/dev/null && $WP plugin delete "$p" --quiet
+	done
+	INACTIVE_THEMES=$($WP theme list --status=inactive --field=name 2>/dev/null || true)
+	[[ -n "$INACTIVE_THEMES" ]] && $WP theme delete $INACTIVE_THEMES --quiet
+	ok "removed bundled plugins and inactive themes"
+
+	# Pretty permalinks from day one; the .htaccess step makes them route.
+	$WP rewrite structure '/%postname%/' --quiet
+
+	umask_old=$(umask); umask 077
+	cat > "$CREDS_FILE" <<CREDS
+WordPress credentials for $DOMAIN
+Generated $(date -Is) by provision-wordpress-tls.sh.
+Move these into your password manager, then delete this file.
+
+Site URL        : $CANONICAL
+Admin URL       : $CANONICAL/wp-admin/
+Admin user      : $ADMIN_USER
+Admin password  : $ADMIN_PASS
+Admin email     : $ADMIN_EMAIL
+
+Database        : $DB_NAME
+DB user         : $DB_USER
+DB password     : $DB_PASS
+DB host         : localhost
+CREDS
+	umask "$umask_old"
+	chown "$CREDS_USER": "$CREDS_FILE"
+	ok "credentials written to $CREDS_FILE (mode 600)"
+fi
+
+chown -R www-data:www-data "$DOCROOT"
+[[ -f "$DOCROOT/wp-config.php" ]] && chmod 640 "$DOCROOT/wp-config.php"
+fi # DO_INSTALL
 
 # ----------------------------------------------------------- 1. rewrites ----
 #
@@ -354,14 +585,12 @@ step "4. WordPress URL configuration"
 
 if ! command -v wp >/dev/null 2>&1; then
 	warn "wp-cli not installed — skipping. Install it with:"
-	warn "    curl -sO https://raw.githubusercontent.com/wp-cli/wp-cli/v2.9.0/phar/wp-cli.phar"
-	warn "    chmod +x wp-cli.phar && mv wp-cli.phar /usr/local/bin/wp"
+	warn "    curl -fsSL -o /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar"
+	warn "    chmod +x /usr/local/bin/wp"
 elif [[ ! -f "$DOCROOT/wp-config.php" ]]; then
 	warn "no wp-config.php in $DOCROOT — skipping"
 else
 	WP="wp --path=$DOCROOT --allow-root"
-	SCHEME=$( (( SKIP_TLS )) && echo http || echo https )
-	CANONICAL="$SCHEME://$( (( WITH_WWW )) && echo "www.$DOMAIN" || echo "$DOMAIN" )"
 
 	CURRENT_HOME=$($WP option get home 2>/dev/null || echo "")
 	if [[ "$CURRENT_HOME" == "$CANONICAL" ]]; then
@@ -373,6 +602,19 @@ else
 		ok "set home and siteurl to $CANONICAL"
 		warn "existing content may still hold the old URL — see README, 'After a migration'"
 	fi
+
+	# Pin the URL in wp-config.php too. The constants override the database,
+	# so a migration import that drags in an http:// home can't flip the site
+	# back — and they replace blueprint defaults like 'http://' . HTTP_HOST.
+	for c in WP_HOME WP_SITEURL; do
+		CUR=$($WP config get "$c" --type=constant 2>/dev/null || echo "")
+		if [[ "$CUR" == "$CANONICAL" ]]; then
+			skip "$c already $CANONICAL in wp-config.php"
+		else
+			run $WP config set "$c" "$CANONICAL" --type=constant --quiet
+			ok "set $c to $CANONICAL in wp-config.php (was: ${CUR:-unset})"
+		fi
+	done
 
 	if (( ! SKIP_TLS )); then
 		if $WP config has FORCE_SSL_ADMIN --type=constant 2>/dev/null; then
@@ -432,9 +674,56 @@ PYEOF
 fi
 fi # DO_WP
 
-# ------------------------------------------------------------- 5. verify ----
+# ------------------------------------------------------------ 5. plugins ----
 
-step "5. Verification"
+if (( ! DO_PLUGINS )); then
+	step "5. Plugins — not selected"
+else
+step "5. Plugins"
+
+WP="wp --path=$DOCROOT --allow-root"
+if ! command -v wp >/dev/null 2>&1; then
+	warn "wp-cli not installed — skipping"
+elif ! $WP core is-installed 2>/dev/null; then
+	warn "no working WordPress in $DOCROOT — skipping"
+else
+	for p in "${WP_PLUGINS[@]}"; do
+		if ! $WP plugin is-installed "$p" 2>/dev/null; then
+			run $WP plugin install "$p" --activate --quiet
+			ok "installed + activated $p"
+		elif ! $WP plugin is-active "$p" 2>/dev/null; then
+			run $WP plugin activate "$p" --quiet
+			ok "activated $p"
+		else
+			skip "$p already active"
+		fi
+	done
+
+	# Breakdance updates itself through its licence once installed, so this
+	# only ever installs it — it never overwrites an existing copy.
+	if $WP plugin is-installed breakdance 2>/dev/null; then
+		if $WP plugin is-active breakdance 2>/dev/null; then
+			skip "breakdance already active"
+		else
+			run $WP plugin activate breakdance --quiet
+			ok "activated breakdance"
+		fi
+	elif [[ -n "$BREAKDANCE_ZIP" ]]; then
+		[[ "$BREAKDANCE_ZIP" == http* || -f "$BREAKDANCE_ZIP" ]] || die "--breakdance: $BREAKDANCE_ZIP not found"
+		run $WP plugin install "$BREAKDANCE_ZIP" --activate --quiet
+		ok "installed + activated breakdance — enter the licence key in its setup wizard"
+	else
+		warn "breakdance not installed — download the zip from breakdance.com and re-run with"
+		warn "    --plugins --breakdance /path/to/breakdance.zip"
+	fi
+
+	(( DRY_RUN )) || chown -R www-data:www-data "$DOCROOT/wp-content"
+fi
+fi # DO_PLUGINS
+
+# ------------------------------------------------------------- 6. verify ----
+
+step "6. Verification"
 
 if (( ! DO_VERIFY )); then
 	skip "not selected"
@@ -445,7 +734,9 @@ else
 	for host in "$DOMAIN" $( (( WITH_WWW )) && echo "www.$DOMAIN" ); do
 		for path in "/" "/wp-json/"; do
 			url="$SCHEME://$host$path"
-			read -r code ctype < <(curl -s -o /dev/null -m 20 -w '%{http_code} %{content_type}' "$url" || echo "000 -")
+			# The trailing \n matters: without it read hits EOF, returns 1, and set -e exits.
+			read -r code ctype < <(curl -s -o /dev/null -m 20 -w '%{http_code} %{content_type}\n' "$url" || true) || true
+			code=${code:-000}
 			case "$path:$code" in
 				/wp-json/:200)
 					ok "$url -> $code $ctype" ;;
@@ -454,6 +745,8 @@ else
 					warn "  iso-8859-1 here means Apache never reached index.php — rewrites still broken" ;;
 				*:200)
 					ok "$url -> $code $ctype" ;;
+				/:301|/:302)
+					ok "$url -> $code (redirect to $CANONICAL)" ;;
 				*)
 					warn "$url -> $code $ctype" ;;
 			esac
@@ -613,13 +906,17 @@ elif [[ ! -f "$DOCROOT/wp-config.php" ]]; then
 	rpt WARN "wp-config.php" "not found in $DOCROOT"
 else
 	WP="wp --path=$DOCROOT --allow-root"
-	SCHEME=$( (( SKIP_TLS )) && echo http || echo https )
-	CANONICAL="$SCHEME://$( (( WITH_WWW )) && echo "www.$DOMAIN" || echo "$DOMAIN" )"
 	for opt in home siteurl; do
 		VAL=$($WP option get "$opt" 2>/dev/null || echo "?")
 		[[ "$VAL" == "$CANONICAL" ]] \
 			&& rpt PASS "wp $opt" "$VAL" \
 			|| rpt FAIL "wp $opt" "$VAL (want $CANONICAL)"
+	done
+	for c in WP_HOME WP_SITEURL; do
+		VAL=$($WP config get "$c" --type=constant 2>/dev/null || echo "")
+		[[ "$VAL" == "$CANONICAL" ]] \
+			&& rpt PASS "$c" "$VAL in wp-config.php" \
+			|| rpt FAIL "$c" "${VAL:-unset} in wp-config.php (want $CANONICAL) — run with --wp-urls"
 	done
 	if (( ! SKIP_TLS )); then
 		$WP config has FORCE_SSL_ADMIN --type=constant 2>/dev/null \
@@ -630,6 +927,28 @@ else
 		grep -q 'PROXY_HTTPS_DETECT' "$DOCROOT/wp-config.php" \
 			&& rpt PASS "proxy HTTPS" "X-Forwarded-Proto block present" \
 			|| rpt FAIL "proxy HTTPS" "missing — is_ssl() will be false behind the proxy"
+	fi
+	for p in "${WP_PLUGINS[@]}" breakdance; do
+		if $WP plugin is-active "$p" 2>/dev/null; then
+			rpt PASS "plugin" "$p $($WP plugin get "$p" --field=version 2>/dev/null || true)"
+		elif $WP plugin is-installed "$p" 2>/dev/null; then
+			rpt WARN "plugin" "$p installed but inactive"
+		else
+			rpt WARN "plugin" "$p not installed — run with --plugins"
+		fi
+	done
+	for p in akismet hello; do
+		$WP plugin is-installed "$p" 2>/dev/null && rpt WARN "plugin" "$p (bundled) still installed"
+	done
+fi
+
+if command -v php >/dev/null 2>&1; then
+	PHPV=$(php -r 'echo PHP_VERSION;')
+	# WordPress recommends 8.3+.
+	if php -r 'exit(version_compare(PHP_VERSION, "8.3", ">=") ? 0 : 1);'; then
+		rpt PASS "php" "$PHPV"
+	else
+		rpt WARN "php" "$PHPV — older than 8.3"
 	fi
 fi
 
