@@ -263,6 +263,10 @@ if (( DO_CERTBOT )); then
 			NEG_NOTE=""
 			[[ -n "$NEG" ]] && NEG_NOTE=" (resolvers may cache that for up to $(( NEG / 60 )) min)"
 			warn "$host: no A record in public DNS$NEG_NOTE"
+			# The SOA names the zone's primary nameserver. Asking it directly
+			# settles "stale cache" vs "record never reached the live zone".
+			ZONE_NS=$(grep -o '"type":6,"TTL":[0-9]*,"data":"[^ "]*' <<<"$J" | sed 's/.*"data":"//; s/\.$//' | head -1 || true)
+			[[ -n "$ZONE_NS" ]] && warn "  ask the zone's own nameserver, which no cache sits in front of:  nslookup $host $ZONE_NS"
 			DNS_BAD=1
 		elif [[ -n "$PUBLIC_IP" ]] && ! grep -qw -- "$PUBLIC_IP" <<<"$IPS"; then
 			if (( BEHIND_PROXY )); then
