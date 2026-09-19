@@ -36,9 +36,10 @@ BREAKDANCE_ZIP=""
 # wordpress.org and needs a licensed download, so it comes from --breakdance.
 WP_PLUGINS=(all-in-one-wp-migration autodescription smtp2go)
 
-# Step selection. None given = every step except --install and --plugins.
+# Step selection. None given = every step except --install, --plugins, --redis.
 DO_INSTALL=0
 DO_PLUGINS=0
+DO_REDIS=0
 DO_HTACCESS=0
 DO_CERTBOT=0
 DO_RENEWAL=0
@@ -79,6 +80,9 @@ Steps (pick any; none given = htaccess certbot renewal wp-urls verify):
   --wp-urls           WP_HOME/WP_SITEURL in wp-config.php, home/siteurl,
                       FORCE_SSL_ADMIN, proxy HTTPS detection
   --plugins           Install + activate the standard plugins
+  --redis             Redis server + php-redis, Redis Object Cache plugin,
+                      object cache enabled. Not part of the default run;
+                      add it alongside --install on a new site.
   --verify            curl / and /wp-json/ on every name
   --report            Run no steps, just print the status report
 
@@ -101,6 +105,7 @@ while [[ $# -gt 0 ]]; do
 		--breakdance)   BREAKDANCE_ZIP="$2"; shift 2 ;;
 		--install)      DO_INSTALL=1; shift ;;
 		--plugins)      DO_PLUGINS=1; shift ;;
+		--redis)        DO_REDIS=1; shift ;;
 		--htaccess)     DO_HTACCESS=1; shift ;;
 		--certbot)      DO_CERTBOT=1; shift ;;
 		--renewal)      DO_RENEWAL=1; shift ;;
@@ -115,7 +120,7 @@ done
 if (( SKIP_TLS && (DO_CERTBOT || DO_RENEWAL) )); then
 	echo "--skip-tls conflicts with --certbot / --renewal" >&2; exit 1
 fi
-ANY_STEP=$(( DO_INSTALL || DO_PLUGINS || DO_HTACCESS || DO_CERTBOT || DO_RENEWAL || DO_WP || DO_VERIFY ))
+ANY_STEP=$(( DO_INSTALL || DO_PLUGINS || DO_REDIS || DO_HTACCESS || DO_CERTBOT || DO_RENEWAL || DO_WP || DO_VERIFY ))
 if (( REPORT_ONLY && ANY_STEP )); then
 	echo "--report runs no steps; drop it or drop the step flags" >&2; exit 1
 fi
@@ -230,6 +235,7 @@ STEPS=""
 (( DO_RENEWAL ))  && STEPS+="renewal "
 (( DO_WP ))       && STEPS+="wp-urls "
 (( DO_PLUGINS ))  && STEPS+="plugins "
+(( DO_REDIS ))    && STEPS+="redis "
 (( DO_VERIFY ))   && STEPS+="verify"
 ok "steps       : $STEPS"
 (( DRY_RUN ))  && warn "DRY RUN — nothing will be modified"
@@ -363,10 +369,11 @@ elif (( DRY_RUN )); then
 		(( DO_RENEWAL ))  && LATER+="renewal "
 		(( DO_WP ))       && LATER+="wp-urls "
 		(( DO_PLUGINS ))  && LATER+="plugins "
+		(( DO_REDIS ))    && LATER+="redis "
 		(( DO_VERIFY ))   && LATER+="verify"
 		skip "then: ${LATER% }"
 		skip "(bare instance — those steps inspect what the install creates, so there's nothing to preview yet)"
-		DO_HTACCESS=0; DO_CERTBOT=0; DO_RENEWAL=0; DO_WP=0; DO_PLUGINS=0; DO_VERIFY=0
+		DO_HTACCESS=0; DO_CERTBOT=0; DO_RENEWAL=0; DO_WP=0; DO_PLUGINS=0; DO_REDIS=0; DO_VERIFY=0
 		BARE_PREVIEW=1
 	fi
 else
@@ -893,9 +900,120 @@ else
 fi
 fi # DO_PLUGINS
 
-# ------------------------------------------------------------- 6. verify ----
+# -------------------------------------------------------------- 6. redis ----
+#
+# Redis as a WordPress object cache: server, the phpredis extension (the
+# plugin prefers it over its bundled Predis), and Redis Object Cache.
 
-step "6. Verification"
+REDIS_CONF=/etc/redis/redis.conf
+REDIS_MARK="# --- provision-wordpress-tls: object cache ---"
+
+if (( ! DO_REDIS )); then
+	step "6. Redis object cache — not selected"
+else
+step "6. Redis object cache"
+
+WP="wp --path=$DOCROOT --allow-root"
+if ! command -v php >/dev/null 2>&1; then
+	warn "PHP not installed — run with --install first"
+elif (( DRY_RUN )); then
+	skip "dry run — would:"
+	skip "  apt install redis-server php-redis, cap memory, no disk persistence"
+	skip "  set WP_REDIS_HOST/PORT/PREFIX, install + enable Redis Object Cache"
+else
+	export DEBIAN_FRONTEND=noninteractive
+	R_PKGS=()
+	for p in redis-server php-redis; do
+		dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "install ok installed" || R_PKGS+=("$p")
+	done
+	if (( ${#R_PKGS[@]} )); then
+		apt-get update -qq
+		apt-get install -y -qq --no-install-recommends "${R_PKGS[@]}" >/dev/null
+		ok "installed ${R_PKGS[*]}"
+	else
+		skip "redis-server and php-redis already installed"
+	fi
+
+	# A cache, not a datastore: cap memory so it can't starve MariaDB and PHP,
+	# evict least-recently-used keys when full, and skip writing snapshots to
+	# disk. Later directives in redis.conf override earlier ones, so a block
+	# appended at the end wins; it's replaced whole on re-run.
+	MEM_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+	if   (( MEM_MB < 1024 )); then R_MAX=64mb
+	elif (( MEM_MB < 2048 )); then R_MAX=128mb
+	else R_MAX=256mb
+	fi
+	R_BLOCK="$REDIS_MARK
+maxmemory $R_MAX
+maxmemory-policy allkeys-lru
+save \"\"
+appendonly no
+# --- end provision-wordpress-tls ---"
+	CUR_BLOCK=$(sed -n "/^$REDIS_MARK\$/,/^# --- end provision-wordpress-tls ---\$/p" "$REDIS_CONF")
+	if [[ "$CUR_BLOCK" == "$R_BLOCK" ]]; then
+		skip "redis.conf already capped at $R_MAX, LRU, no persistence"
+	else
+		cp -a "$REDIS_CONF" "$REDIS_CONF.bak.$(date +%Y%m%d%H%M%S)"
+		sed -i "/^$REDIS_MARK\$/,/^# --- end provision-wordpress-tls ---\$/d" "$REDIS_CONF"
+		printf '\n%s\n' "$R_BLOCK" >> "$REDIS_CONF"
+		ok "redis.conf: maxmemory $R_MAX, allkeys-lru, no persistence (${MEM_MB}M RAM)"
+	fi
+	systemctl enable --now redis-server >/dev/null 2>&1 || true
+	systemctl restart redis-server
+	# Load the new extension into PHP.
+	PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+	if unit_loaded "php$PHP_VER-fpm.service"; then
+		systemctl restart "php$PHP_VER-fpm"
+	else
+		systemctl reload apache2 || true
+	fi
+	redis-cli ping 2>/dev/null | grep -q PONG || die "redis-server is not answering — journalctl -u redis-server"
+	ok "redis-server answering, php-redis loaded"
+
+	if ! $WP core is-installed 2>/dev/null; then
+		warn "no working WordPress in $DOCROOT — Redis is running, but the plugin is not set up"
+	else
+		# The prefix keeps keys apart if another site ever shares this Redis.
+		for kv in "WP_REDIS_HOST=127.0.0.1" "WP_REDIS_PORT=6379" "WP_REDIS_PREFIX=$DOMAIN:"; do
+			k=${kv%%=*}; v=${kv#*=}
+			if [[ "$($WP config get "$k" --type=constant 2>/dev/null || true)" == "$v" ]]; then
+				skip "$k already $v"
+			elif [[ "$k" == WP_REDIS_PORT ]]; then
+				$WP config set "$k" "$v" --raw --type=constant --quiet; ok "set $k $v"
+			else
+				$WP config set "$k" "$v" --type=constant --quiet; ok "set $k $v"
+			fi
+		done
+
+		if ! $WP plugin is-installed redis-cache 2>/dev/null; then
+			$WP plugin install redis-cache --activate --quiet
+			ok "installed + activated redis-cache (Redis Object Cache)"
+		elif ! $WP plugin is-active redis-cache 2>/dev/null; then
+			$WP plugin activate redis-cache --quiet
+			ok "activated redis-cache"
+		else
+			skip "redis-cache already active"
+		fi
+
+		# The object-cache.php drop-in is what actually turns caching on. Never
+		# overwrite one that belongs to a different cache plugin.
+		DROPIN="$DOCROOT/wp-content/object-cache.php"
+		if [[ -f "$DROPIN" ]] && grep -q "Redis Object Cache" "$DROPIN"; then
+			skip "object cache drop-in already enabled"
+		elif [[ -f "$DROPIN" ]]; then
+			warn "wp-content/object-cache.php belongs to another plugin — not replacing it"
+		else
+			$WP redis enable --quiet >/dev/null
+			ok "object cache enabled"
+		fi
+		chown -R www-data:www-data "$DOCROOT/wp-content"
+	fi
+fi
+fi # DO_REDIS
+
+# ------------------------------------------------------------- 7. verify ----
+
+step "7. Verification"
 
 if (( ! DO_VERIFY )); then
 	skip "not selected"
@@ -1124,6 +1242,31 @@ else
 	for p in akismet hello; do
 		$WP plugin is-installed "$p" 2>/dev/null && rpt WARN "plugin" "$p (bundled) still installed"
 	done
+	# Only once Redis is in play on this site — not every site uses it.
+	if $WP plugin is-installed redis-cache 2>/dev/null; then
+		R_STATUS=$($WP redis status 2>/dev/null || true)
+		if grep -q "Status: Connected" <<<"$R_STATUS"; then
+			R_CLIENT=$(sed -n 's/^Client: //p' <<<"$R_STATUS" | head -1 || true)
+			rpt PASS "object cache" "connected${R_CLIENT:+ via $R_CLIENT}"
+		else
+			R_LINE=$(sed -n 's/^Status: //p' <<<"$R_STATUS" | head -1 || true)
+			rpt FAIL "object cache" "${R_LINE:-not connected} — run with --redis"
+		fi
+	fi
+fi
+
+if command -v redis-server >/dev/null 2>&1; then
+	if redis-cli ping 2>/dev/null | grep -q PONG; then
+		R_MAXB=$(redis-cli config get maxmemory 2>/dev/null | sed -n 2p || true)
+		R_POL=$(redis-cli config get maxmemory-policy 2>/dev/null | sed -n 2p || true)
+		if [[ "${R_MAXB:-0}" == 0 ]]; then
+			rpt WARN "redis" "running, but no maxmemory — it can grow until the box swaps (run with --redis)"
+		else
+			rpt PASS "redis" "$(redis-server --version | awk '{print $3}' | cut -d= -f2), max $(( R_MAXB / 1048576 ))MB, $R_POL"
+		fi
+	else
+		rpt FAIL "redis" "installed but not answering — systemctl status redis-server"
+	fi
 fi
 
 if command -v php >/dev/null 2>&1; then

@@ -18,8 +18,22 @@ actually bitten us, not a hypothetical.
 
 ### New site on a bare instance
 
-Create a Lightsail instance from the plain **Debian 13** OS blueprint (not the
-WordPress one), point DNS for the apex and `www` at its static IP, then:
+In the Lightsail console:
+
+1. Create an instance from the plain **Debian 13** OS blueprint, not the
+   WordPress one.
+2. **Attach a static IP** (Networking tab). The default public IP changes
+   whenever the instance is stopped and started.
+3. **Open port 443** in the instance firewall. Lightsail opens only 22 and 80
+   by default; the certificate still issues without 443 (Let's Encrypt checks
+   over 80), but nobody can reach the site over https.
+4. Add `A` records for the apex and `www` pointing at the static IP. No `www`
+   wanted, e.g. for a subdomain? Skip that record and add `--no-www` below.
+   Put the records in whichever DNS provider the domain's nameservers point
+   at — a record in Lightsail's own DNS zones does nothing if the domain uses
+   Cloudflare.
+
+Then on the instance:
 
 ```bash
 ssh admin@HOST
@@ -30,12 +44,13 @@ chmod +x provision-wordpress-tls.sh
 #   scp breakdance.zip admin@HOST:~
 
 sudo ./provision-wordpress-tls.sh --domain example.co.nz --email you@example.com \
-  --install --breakdance ~/breakdance.zip
+  --install --redis --breakdance ~/breakdance.zip
 ```
 
 That installs the stack and WordPress, then runs every other step: `.htaccess`,
-certificate, renewal, URLs, plugins, verification and the report. The
-WordPress and database passwords are in `~/wordpress_credentials`.
+certificate, renewal, URLs, plugins, Redis, verification and the report. The
+WordPress and database passwords are in `~/wordpress_credentials`. Drop
+`--redis` for a site without an object cache.
 
 Before requesting a certificate, the script checks DNS against **public**
 resolvers (Cloudflare, falling back to Google). That's what Let's Encrypt
@@ -76,22 +91,24 @@ Behind Cloudflare or a load balancer that terminates TLS, add `--behind-proxy`.
 | `--breakdance` | Breakdance zip, local path or URL, for the plugins step. |
 
 To run only some steps, pass one or more step flags. With none, steps 1–4 and
-6 run. `--install` on its own runs everything, steps 0–6.
+7 run. `--install` on its own runs steps 0–5 and 7; add `--redis` for step 6.
 
 | Step flag | Runs |
 |---|---|
 | `--install` | Step 0: Apache, PHP-FPM, MariaDB, wp-cli and the latest WordPress on bare Debian 13 |
 | `--htaccess` | Step 1: `mod_rewrite`, `AllowOverride All`, the WordPress `.htaccess` |
 | `--certbot` | Step 2: install certbot and the apache plugin, obtain or expand the cert. Needs `--email`. |
-| `--renewal` | Step 3: check the renewal timer, install the Apache reload hook |
+| `--renewal` | Step 3: check the renewal timer (starting it if it's stopped), install the Apache reload hook |
 | `--wp-urls` | Step 4: `WP_HOME`/`WP_SITEURL` in `wp-config.php`, `home`/`siteurl`, `FORCE_SSL_ADMIN`, and with `--behind-proxy` the proxy HTTPS block |
 | `--plugins` | Step 5: install and activate the standard plugins |
-| `--verify` | Step 6: curl `/` and `/wp-json/` on every name |
+| `--redis` | Step 6: Redis server, `php-redis`, Redis Object Cache, object cache enabled |
+| `--verify` | Step 7: curl `/` and `/wp-json/` on every name |
 
 ```bash
 sudo ./provision-wordpress-tls.sh --domain example.co.nz --htaccess --verify
 sudo ./provision-wordpress-tls.sh --domain example.co.nz --email you@example.com --certbot --renewal
 sudo ./provision-wordpress-tls.sh --domain example.co.nz --plugins --breakdance ~/breakdance.zip
+sudo ./provision-wordpress-tls.sh --domain example.co.nz --redis
 ```
 
 `--skip-tls` can't be combined with `--certbot` or `--renewal`.
@@ -174,7 +191,13 @@ has no certbot package and a different Apache layout altogether.
 
 It refuses to install over a docroot that already has something other than
 Debian's placeholder page in it. If WordPress is already installed it leaves
-it alone, so re-running is safe.
+the site alone, apart from repairing core files that fail their checksums, so
+re-running is safe.
+
+It also adds a global `ServerName` (silences Apache's AH00558 warning) and
+points wp-cli's temporary files at `/var/tmp`. Debian 13 keeps `/tmp` in RAM,
+capped at half of it, which on a small instance is too little to unpack
+WordPress.
 
 ### 1. Rewrite prerequisites
 
@@ -280,9 +303,15 @@ Then verify end to end, which is the step everyone skips:
 sudo certbot renew --dry-run
 ```
 
-Also check `/etc/letsencrypt/renewal/DOMAIN.conf` lists every domain. That file
-is what renewal replays, so if it only has the apex you quietly lose the `www`
-SAN at the next renewal.
+Renewal reissues the certificate for the names it already covers. It never
+adds one, so a certificate missing `www` stays missing it through every
+renewal. Check what each certificate covers with:
+
+```bash
+sudo certbot certificates
+```
+
+The script's certbot step reissues with `--expand` when a name is missing.
 
 If you genuinely prefer cron to timers, disable the built-in one first:
 
@@ -339,6 +368,33 @@ The SMTP2GO API key goes in its settings page. It's a secret, so it isn't
 handled here.
 
 To change the list, edit `WP_PLUGINS` at the top of the script.
+
+### 6. Redis object cache (`--redis`)
+
+Not part of the default run. Add it when a site should have an object cache.
+
+- **`redis-server` and `php-redis`.** Debian 13 ships Redis 8.0 (Valkey 8.1
+  is also packaged; Redis Object Cache works with either). The `php-redis`
+  extension is faster than the pure-PHP client the plugin falls back to.
+- **Capped, and no disk persistence.** It's a cache, not a datastore. A block
+  at the end of `/etc/redis/redis.conf` sets `maxmemory` by instance size
+  (64 MB under 1 GB RAM, 128 MB under 2 GB, else 256 MB) and
+  `allkeys-lru`, so a full cache evicts old keys instead of eating the memory
+  MariaDB and PHP need. Snapshots and the append-only file are off: losing
+  the cache on restart costs nothing. Redis listens on localhost only, which
+  is the Debian default.
+- **WordPress side.** `WP_REDIS_HOST`, `WP_REDIS_PORT` and a
+  `WP_REDIS_PREFIX` of `DOMAIN:` in `wp-config.php`. The prefix keeps keys
+  apart if two sites ever share one Redis. Then Redis Object Cache
+  (`redis-cache`) is installed and activated, and `wp redis enable` writes
+  the `object-cache.php` drop-in that actually turns caching on. An existing
+  drop-in from a different cache plugin is left alone.
+
+On an existing site it installs only what's missing, but it does apply the
+`redis.conf` block and restart Redis and PHP, which empties the cache. The
+report shows the object cache connection and Redis's memory cap whenever the
+plugin or server is present, so on an older server run `--report` first to
+see what's there.
 
 ## After a migration
 
@@ -413,7 +469,10 @@ echo | openssl s_client -connect DOMAIN:443 -servername DOMAIN 2>/dev/null \
 sudo certbot renew --dry-run                                                       # passes
 systemctl list-timers --all | grep -i certbot                                      # scheduled
 wp option get home                                                                 # https, canonical
+wp redis status                                                                    # Status: Connected (if --redis)
 ```
+
+Or run `--report`, which checks all of it.
 
 Check the **bare** domain as well as `www` — a cert missing the apex only shows
 up if you test it.
