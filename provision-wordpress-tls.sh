@@ -227,8 +227,14 @@ fi
 # phpMyAdmin, no bundled plugins. Passwords are generated on the host and only
 # ever written to wp-config.php and the credentials file — never to the repo.
 
-# Credentials land in the home of whoever ran sudo (admin on Lightsail).
-CREDS_USER="${SUDO_USER:-root}"
+# Credentials land in the home of whoever ran sudo (admin on Lightsail). From
+# a root shell (sudo -i, sudo su) fall back to the instance's login user,
+# UID 1000, so the file still ends up in /home/admin rather than /root.
+CREDS_USER="${SUDO_USER:-}"
+if [[ -z "$CREDS_USER" || "$CREDS_USER" == root ]]; then
+	CREDS_USER=$(getent passwd 1000 | cut -d: -f1 || true)
+	CREDS_USER="${CREDS_USER:-root}"
+fi
 CREDS_HOME=$(getent passwd "$CREDS_USER" | cut -d: -f6 || true)
 CREDS_FILE="${CREDS_HOME:-/root}/wordpress_credentials"
 
