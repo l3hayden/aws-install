@@ -40,6 +40,7 @@ WP_PLUGINS=(all-in-one-wp-migration autodescription smtp2go)
 
 # Step selection. None given = every step except --install, --plugins, --redis.
 DO_INSTALL=0
+DO_DB=0
 DO_PLUGINS=0
 DO_REDIS=0
 DO_HTACCESS=0
@@ -80,11 +81,13 @@ Options:
                       from breakdance.com (needs your login).
   -h, --help          This message
 
-Steps (pick any; none given = htaccess certbot renewal wp-urls verify):
+Steps (pick any; none given = mariadb htaccess certbot renewal wp-urls verify):
   --install           Bare Debian 13+ instance: Apache, PHP-FPM, MariaDB,
                       wp-cli, latest WordPress with no bundled plugins,
                       credentials to ~/wordpress_credentials. On its own it
                       also runs every other step, plugins included.
+  --mariadb           Size the MariaDB buffer pool to the instance RAM
+                      (restarts MariaDB only if the running value is wrong)
   --htaccess          Check/build rewrite prerequisites: mod_rewrite,
                       AllowOverride All, and the WordPress .htaccess
   --certbot           Install certbot + apache plugin, obtain/expand the cert
@@ -120,6 +123,7 @@ while [[ $# -gt 0 ]]; do
 		--admin-email)  ADMIN_EMAIL="$2"; shift 2 ;;
 		--breakdance)   BREAKDANCE_ZIP="$2"; shift 2 ;;
 		--install)      DO_INSTALL=1; shift ;;
+		--mariadb)      DO_DB=1; shift ;;
 		--plugins)      DO_PLUGINS=1; shift ;;
 		--redis)        DO_REDIS=1; shift ;;
 		--htaccess)     DO_HTACCESS=1; shift ;;
@@ -136,12 +140,12 @@ done
 if (( SKIP_TLS && (DO_CERTBOT || DO_RENEWAL) )); then
 	echo "--skip-tls conflicts with --certbot / --renewal" >&2; exit 1
 fi
-ANY_STEP=$(( DO_INSTALL || DO_PLUGINS || DO_REDIS || DO_HTACCESS || DO_CERTBOT || DO_RENEWAL || DO_WP || DO_VERIFY ))
+ANY_STEP=$(( DO_INSTALL || DO_DB || DO_PLUGINS || DO_REDIS || DO_HTACCESS || DO_CERTBOT || DO_RENEWAL || DO_WP || DO_VERIFY ))
 if (( REPORT_ONLY && ANY_STEP )); then
 	echo "--report runs no steps; drop it or drop the step flags" >&2; exit 1
 fi
 # --install on its own is a fresh box: it wants everything.
-if (( DO_INSTALL && ! (DO_PLUGINS || DO_HTACCESS || DO_CERTBOT || DO_RENEWAL || DO_WP || DO_VERIFY) )); then
+if (( DO_INSTALL && ! (DO_DB || DO_PLUGINS || DO_HTACCESS || DO_CERTBOT || DO_RENEWAL || DO_WP || DO_VERIFY) )); then
 	DO_PLUGINS=1
 	ANY_STEP=0
 fi
@@ -152,7 +156,7 @@ if (( CANON_GIVEN && ! ANY_STEP && ! REPORT_ONLY )); then
 	ANY_STEP=1
 fi
 if (( ! REPORT_ONLY && ! ANY_STEP )); then
-	DO_HTACCESS=1; DO_WP=1; DO_VERIFY=1
+	DO_DB=1; DO_HTACCESS=1; DO_WP=1; DO_VERIFY=1
 	(( SKIP_TLS )) || { DO_CERTBOT=1; DO_RENEWAL=1; }
 fi
 
@@ -187,6 +191,24 @@ did()  { (( DRY_RUN )) || ok "$@"; }
 # Ask systemd about a unit directly rather than grepping list output, whose
 # format changes between releases.
 unit_loaded() { [[ "$(systemctl show -p LoadState --value "$1" 2>/dev/null || true)" == loaded ]]; }
+
+# InnoDB buffer pool for this instance, in MB. It is where MariaDB keeps table
+# and index pages; anything that doesn't fit is read from disk on every query,
+# which on Lightsail shows as I/O wait while the CPU graph looks idle. Leaves
+# room for PHP-FPM, Apache and a capped Redis. Thresholds sit below each
+# Lightsail plan's nominal size because the kernel reserves some (a 1 GB plan
+# reports about 945M).
+innodb_pool_mb() {
+	local mem
+	mem=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+	if   (( mem <  768 )); then echo 64      # 512 MB plan
+	elif (( mem < 1536 )); then echo 128     # 1 GB
+	elif (( mem < 3072 )); then echo 512     # 2 GB
+	elif (( mem < 6144 )); then echo 1024    # 4 GB
+	else echo $(( mem / 2 / 128 * 128 ))     # 8 GB and up: half, in 128M chunks
+	fi
+}
+MARIADB_CNF=/etc/mysql/mariadb.conf.d/99-wordpress.cnf
 
 # certbot's scheduler: apt installs certbot.timer, snap installs its own.
 certbot_timer() {
@@ -308,6 +330,7 @@ ok "canonical   : $CANONICAL${OTHER_HOST:+  ($OTHER_HOST redirects here)}"
 ok "docroot     : $DOCROOT"
 STEPS=""
 (( DO_INSTALL ))  && STEPS+="install "
+(( DO_DB ))       && STEPS+="mariadb "
 (( DO_HTACCESS )) && STEPS+="htaccess "
 (( DO_CERTBOT ))  && STEPS+="certbot "
 (( DO_RENEWAL ))  && STEPS+="renewal "
@@ -442,6 +465,7 @@ elif (( DRY_RUN )); then
 	# nothing to inspect yet, so previewing them just prints noise and FAILs.
 	if ! command -v apache2ctl >/dev/null 2>&1; then
 		LATER=""
+		(( DO_DB ))       && LATER+="mariadb "
 		(( DO_HTACCESS )) && LATER+="htaccess "
 		(( DO_CERTBOT ))  && LATER+="certbot "
 		(( DO_RENEWAL ))  && LATER+="renewal "
@@ -451,7 +475,7 @@ elif (( DRY_RUN )); then
 		(( DO_VERIFY ))   && LATER+="verify"
 		skip "then: ${LATER% }"
 		skip "(bare instance — those steps inspect what the install creates, so there's nothing to preview yet)"
-		DO_HTACCESS=0; DO_CERTBOT=0; DO_RENEWAL=0; DO_WP=0; DO_PLUGINS=0; DO_REDIS=0; DO_VERIFY=0
+		DO_DB=0; DO_HTACCESS=0; DO_CERTBOT=0; DO_RENEWAL=0; DO_WP=0; DO_PLUGINS=0; DO_REDIS=0; DO_VERIFY=0
 		BARE_PREVIEW=1
 	fi
 else
@@ -652,6 +676,47 @@ fi
 chown -R www-data:www-data "$DOCROOT"
 [[ -f "$DOCROOT/wp-config.php" ]] && chmod 640 "$DOCROOT/wp-config.php"
 fi # DO_INSTALL
+
+# ------------------------------------------------------------ 0b. mariadb ---
+
+# Size MariaDB's buffer pool to the instance. Debian's default is 128M, and
+# Lightsail images add 90-lightsail-memory.cnf capping it at 16M, which leaves
+# even a modest WordPress database reading from disk on every uncached page.
+# Files in mariadb.conf.d load in name order, so 99- wins over both.
+if (( ! DO_DB )); then
+	step "0b. MariaDB buffer pool — not selected"
+else
+step "0b. MariaDB buffer pool"
+if ! command -v mariadb >/dev/null 2>&1; then
+	warn "MariaDB not installed on this host — skipping"
+else
+	POOL_MB=$(innodb_pool_mb)
+	POOL_RAM=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+	POOL_CNF="# Written by provision-wordpress-tls.sh, sized for ${POOL_RAM}M RAM.
+# Loads after 50-server.cnf and Lightsail's 90-lightsail-memory.cnf, so it wins.
+[mysqld]
+innodb_buffer_pool_size = ${POOL_MB}M"
+	POOL_NOW=$(( $(mariadb -Nse 'SELECT @@innodb_buffer_pool_size' 2>/dev/null || echo 0) / 1048576 ))
+	LATER_CNF=$(find /etc/mysql/mariadb.conf.d -maxdepth 1 -name '*.cnf' 2>/dev/null \
+		| sort | awk -v me="$MARIADB_CNF" '$0 > me' | xargs -r grep -l innodb_buffer_pool_size 2>/dev/null || true)
+	[[ -n "$LATER_CNF" ]] && warn "$LATER_CNF loads after $MARIADB_CNF and also sets the buffer pool — it wins"
+
+	write_file "$MARIADB_CNF" "$POOL_CNF"
+	if (( POOL_NOW == POOL_MB )); then
+		skip "running with ${POOL_MB}M already (${POOL_RAM}M RAM)"
+	elif (( DRY_RUN )); then
+		skip "would restart MariaDB: ${POOL_NOW}M -> ${POOL_MB}M (${POOL_RAM}M RAM)"
+	else
+		# Only when the running value is wrong: a restart drops connections
+		# for a second or two.
+		systemctl restart mariadb
+		POOL_NOW=$(( $(mariadb -Nse 'SELECT @@innodb_buffer_pool_size' 2>/dev/null || echo 0) / 1048576 ))
+		(( POOL_NOW == POOL_MB )) \
+			&& ok "MariaDB restarted with a ${POOL_MB}M buffer pool (${POOL_RAM}M RAM)" \
+			|| warn "MariaDB restarted but reports ${POOL_NOW}M, not ${POOL_MB}M — check mariadb.conf.d"
+	fi
+fi
+fi # DO_DB
 
 # ----------------------------------------------------------- 1. rewrites ----
 #
@@ -1336,6 +1401,21 @@ else
 		else
 			rpt PASS "cert expiry" "$DAYS days ($END)"
 		fi
+	fi
+fi
+
+# --- MariaDB
+if ! command -v mariadb >/dev/null 2>&1; then
+	rpt N/A "mariadb" "not installed on this host"
+else
+	POOL_B=$(mariadb -Nse 'SELECT @@innodb_buffer_pool_size' 2>/dev/null || true)
+	WANT_MB=$(innodb_pool_mb)
+	if [[ -z "$POOL_B" ]]; then
+		rpt WARN "buffer pool" "couldn't ask MariaDB — is it running?"
+	elif (( POOL_B / 1048576 < WANT_MB )); then
+		rpt WARN "buffer pool" "$(( POOL_B / 1048576 ))MB, want ${WANT_MB}MB for this RAM — run with --mariadb"
+	else
+		rpt PASS "buffer pool" "$(( POOL_B / 1048576 ))MB"
 	fi
 fi
 

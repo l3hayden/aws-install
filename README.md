@@ -96,12 +96,13 @@ Behind Cloudflare or a load balancer that terminates TLS, add `--behind-proxy`.
 | `--admin-email` | WordPress admin email for `--install`. Default: `--email`. |
 | `--breakdance` | Breakdance zip, local path or URL, for the plugins step. |
 
-To run only some steps, pass one or more step flags. With none, steps 1–4 and
+To run only some steps, pass one or more step flags. With none, steps 0b, 1–4 and
 7 run. `--install` on its own runs steps 0–5 and 7; add `--redis` for step 6.
 
 | Step flag | Runs |
 |---|---|
 | `--install` | Step 0: Apache, PHP-FPM, MariaDB, wp-cli and the latest WordPress on bare Debian 13 |
+| `--mariadb` | Step 0b: size the MariaDB buffer pool to the instance RAM; restarts MariaDB only if the running value is wrong |
 | `--htaccess` | Step 1: `mod_rewrite`, `AllowOverride All`, the WordPress `.htaccess` |
 | `--certbot` | Step 2: install certbot and the apache plugin, obtain or expand the cert. Needs `--email`. |
 | `--renewal` | Step 3: check the renewal timer (starting it if it's stopped), install the Apache reload hook |
@@ -137,6 +138,7 @@ sudo ./provision-wordpress-tls.sh --domain example.co.nz --report
     FAIL  apache plugin    NOT installed but required (renewal uses authenticator=apache installer=apache) — apt install python3-certbot-apache
     FAIL  cert names       has: example.co.nz  missing: www.example.co.nz
     PASS  cert expiry      59 days (Nov 18 00:19:06 2026 GMT)
+    PASS  buffer pool      512MB
     PASS  renew scheduler  certbot.timer enabled+active, next: Sat 2026-09-19 22:13:00
     PASS  reload hook      /etc/letsencrypt/renewal-hooks/deploy/reload-apache.sh
     PASS  wp home          https://www.example.co.nz
@@ -209,6 +211,35 @@ It also adds a global `ServerName` (silences Apache's AH00558 warning) and
 points wp-cli's temporary files at `/var/tmp`. Debian 13 keeps `/tmp` in RAM,
 capped at half of it, which on a small instance is too little to unpack
 WordPress.
+
+### 0b. MariaDB buffer pool (`--mariadb`)
+
+Part of the default run and of `--install`. Sizes InnoDB's buffer pool, the
+memory MariaDB keeps table and index pages in, to the instance:
+
+| Instance RAM | Buffer pool |
+|---|---|
+| 512 MB | 64 MB |
+| 1 GB | 128 MB |
+| 2 GB | 512 MB |
+| 4 GB | 1 GB |
+| 8 GB and up | half of RAM |
+
+That leaves room for PHP-FPM, Apache and a capped Redis. The thresholds sit
+below each plan's nominal size because the kernel keeps some back: a 1 GB
+plan reports about 945 MB.
+
+It's written to `/etc/mysql/mariadb.conf.d/99-wordpress.cnf`. Lightsail's
+Debian image ships `90-lightsail-memory.cnf`, which caps the pool at **16 MB**.
+A database of any size then reads from disk on every uncached page, and it
+shows up as I/O wait, not CPU, so the Lightsail CPU graph looks idle while the
+site crawls. Files in that directory load in name order, so `99-` wins. The
+step warns if some other file loads later and sets the pool too.
+
+MariaDB is restarted only when the running value differs from the target,
+which drops connections for a second or two. Resize the instance and re-run
+with `--mariadb` to resize the pool with it. The report shows the running
+value and warns if it's below the target for the instance's RAM.
 
 ### 1. Rewrite prerequisites
 
